@@ -88,6 +88,8 @@ Each dictionary represents one test vector:
 4. **Variable names**: Must exactly match the INPUT signal names from module header.
 5. **Dictionary format**: Each test vector MUST be a dictionary with INPUT signal names as keys.
 6. **IMPORTANT**: DO NOT hard-code stimulus as JSON arrays directly. Use Python programming techniques to generate them dynamically.
+7. **Hard cap**: Generate at most 100 test vectors. Exhaustive testing is only allowed when the total input space is 64 combinations or fewer.
+8. **Coverage mix**: Prefer a compact mix of zeros, ones, one-hot/walking-bit, alternating patterns, boundary values, and random cases. Wide buses must be sampled; never loop over `2**width` for large widths.
 
 ## Programming Techniques Required
 
@@ -96,16 +98,17 @@ You can use Python programming constructs to generate test vectors:
 - Use `numpy` for array operations and batch generation
 - Use list comprehensions and loops for dynamic generation
 - Use format strings to convert numbers to binary
-- Use range() and iterators for exhaustive testing
+- Use bounded loops. Do not create unbounded or huge exhaustive products.
 
 
 
 
 ## Key Techniques
 
-**Exhaustive testing with bit manipulation:**
+**Small exhaustive testing with bit manipulation only when width is small:**
 ```python
-for i in range(2**width):
+limit = min(2**width, 64)
+for i in range(limit):
     signal = format(i, f'0{{width}}b')
 ```
 
@@ -117,13 +120,13 @@ test_vectors.append({{"data": format(val, '08b')}})
 
 **Batch generation with numpy:**
 ```python
-values = np.random.randint(0, 256, 100)  # 100 random 8-bit values
+values = np.random.randint(0, 256, 32)  # bounded random 8-bit values
 signals = [format(v, '08b') for v in values]
 ```
 
 **List comprehension for signal generation:**
 ```python
-random_signals = [format(random.getrandbits(8), '08b') for _ in range(50)]
+random_signals = [format(random.getrandbits(8), '08b') for _ in range(32)]
 ```
 
 ## Complete Example
@@ -167,6 +170,7 @@ import json
 import random
 import numpy as np
 import re
+import os
 """
 
 CMB_TAIL = """
@@ -201,10 +205,24 @@ def extract_module_ports(verilog_file="top_module.v"):
         output_pattern = r'output\\s+(?:(?:wire|reg|logic)\\s+)?(?:\\[\\s*\\d+\\s*:\\s*\\d+\\s*\\])?\\s*(\\w+)'
         outputs = set(re.findall(output_pattern, port_list))
 
-        return {"inputs": inputs, "outputs": outputs}
+        widths = {}
+        width_pattern = r'\\b(input|output)\\s+(?:(?:wire|reg|logic)\\s+)?(?:\\[\\s*(\\d+)\\s*:\\s*(\\d+)\\s*\\]\\s*)?(\\w+)'
+        for _direction, msb, lsb, name in re.findall(width_pattern, port_list):
+            if msb and lsb:
+                widths[name] = abs(int(msb) - int(lsb)) + 1
+            else:
+                widths[name] = 1
+
+        return {"inputs": inputs, "outputs": outputs, "widths": widths}
     except Exception as e:
         print(f"Error extracting ports: {e}")
-        return {"inputs": set(), "outputs": set()}
+        return {"inputs": set(), "outputs": set(), "widths": {}}
+
+def resolve_verilog_file(preferred="module_code.v"):
+    for candidate in [preferred, "module_code.v", "top_module.v"]:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return preferred
 
 def fuzzy_match_signal(test_name, actual_signals):
     \"\"\"Fuzzy match test signal name to actual signal name.\"\"\"
@@ -262,8 +280,25 @@ def fix_stimulus(stimulus_data, verilog_file="top_module.v"):
     ports = extract_module_ports(verilog_file)
     expected_inputs = ports["inputs"]  # Only INPUT signals should be in stimulus
     expected_outputs = ports["outputs"]  # OUTPUT signals used for filtering only
+    widths = ports.get("widths", {})
     if not expected_inputs:
         return stimulus_data, ["Could not extract input ports"]
+
+    def normalize_value(value, width):
+        text = str(value).strip().replace("_", "")
+        if text.startswith(("0b", "0B")):
+            text = text[2:]
+        if not text or any(ch not in "01" for ch in text):
+            try:
+                text = format(int(str(value), 0), f"0{width}b")
+            except Exception:
+                text = "0" * width
+        if len(text) > width:
+            text = text[-width:]
+        elif len(text) < width:
+            text = text.zfill(width)
+        return text
+
     corrected_data, warnings = [], []
     for idx, test_vector in enumerate(stimulus_data):
         if not isinstance(test_vector, dict):
@@ -278,23 +313,52 @@ def fix_stimulus(stimulus_data, verilog_file="top_module.v"):
             # Try to match to input signals (stimulus should only contain inputs)
             matched = fuzzy_match_signal(test_signal, expected_inputs)
             if matched:
-                corrected_vector[matched] = value
+                corrected_vector[matched] = normalize_value(value, widths.get(matched, 1))
             else:
                 warnings.append(f"Signal '{test_signal}' not matched to any input, skipping")
         for expected_signal in expected_inputs:
             if expected_signal not in corrected_vector:
-                random_val = format(random.randint(0, 255), '08b')
+                width = widths.get(expected_signal, 1)
+                random_val = format(random.getrandbits(width), f"0{width}b")
                 corrected_vector[expected_signal] = random_val
                 warnings.append(f"Added missing '{expected_signal}': {random_val}")
         corrected_data.append(corrected_vector)
     return corrected_data, warnings
+
+def cap_stimulus(stimulus_data):
+    max_vectors = int(os.environ.get("PRO_V_MAX_CMB_VECTORS", "100"))
+    if not isinstance(stimulus_data, list) or len(stimulus_data) <= max_vectors:
+        return stimulus_data, []
+
+    selected = []
+    seen = set()
+    for idx in list(range(min(16, len(stimulus_data)))) + list(range(len(stimulus_data) - 16, len(stimulus_data))):
+        if 0 <= idx < len(stimulus_data) and idx not in seen:
+            selected.append(stimulus_data[idx])
+            seen.add(idx)
+
+    remaining = [i for i in range(len(stimulus_data)) if i not in seen]
+    budget = max_vectors - len(selected)
+    if budget > 0:
+        if len(remaining) <= budget:
+            sampled = remaining
+        else:
+            random.seed(0)
+            sampled = sorted(random.sample(remaining, budget))
+        selected.extend(stimulus_data[i] for i in sampled)
+
+    return selected[:max_vectors], [f"Capped combinational stimulus from {len(stimulus_data)} to {max_vectors} vectors"]
 
 if __name__ == "__main__":
     import os
     import sys
     result = stimulus_gen()
     print("\\n=== Fixing and verifying stimulus ===")
-    fixed_result, warnings = fix_stimulus(result, verilog_file="top_module.v")
+    verilog_file = resolve_verilog_file()
+    fixed_result, warnings = fix_stimulus(result, verilog_file=verilog_file)
+    capped_result, cap_warnings = cap_stimulus(fixed_result)
+    fixed_result = capped_result
+    warnings.extend(cap_warnings)
     if warnings:
         print("⚠ Warnings:")
         for w in warnings: print(f"  - {w}")
@@ -392,17 +456,17 @@ Do NOT include `clk` or output signals `Y1`, `Y3` in your test scenarios.
 4. **Binary strings only**: Use "0", "1", etc. No 'X' or 'Z' values.
 5. **CRITICAL - Signal Names**: You MUST use EXACTLY the same INPUT signal names as in the module_header above (excluding clk). DO NOT use generic names like "reset", "enable", etc. if the actual signal names are different (e.g., "areset", "en").
 6. **All inputs included**: Include all INPUT signals from module header (except clk). DO NOT include output signals.
-7. **CRITICAL - Sufficient Test Coverage**: Generate AT LEAST 50-100 test scenarios total:
-   - Reset sequences: 5-10 scenarios
-   - Normal operation patterns: 10-20 scenarios
-   - Edge cases (boundaries, state transitions): 10-20 scenarios
-   - Random test cases: 30-50 scenarios
-   - **IMPORTANT**: Do NOT generate just 1-2 test cases! This is insufficient for proper testing.
+7. **Bounded test coverage**: Generate 8-24 test scenarios total. Each scenario should normally use 4-32 cycles. Keep total cycles across all scenarios under 512.
+   - Reset/initialization sequences: 2-4 scenarios
+   - Normal operation patterns: 3-8 scenarios
+   - Edge cases and state transitions: 3-8 scenarios
+   - Random test cases: 4-12 scenarios
+   - Do not generate 50-100 scenarios; that causes avoidable simulator timeouts.
 8. **Comprehensive testing**: Include:
-   - Reset sequences (active and release)
+   - Reset sequences (active and release). Distinguish synchronous reset, which changes on clock edges, from asynchronous reset, which can be asserted before or outside a clock edge.
    - Normal operation with different input patterns
    - Edge cases (state transitions, wraparounds, corner cases)
-   - Exhaustive or near-exhaustive patterns for small input spaces
+   - Exhaustive or near-exhaustive patterns only for very small input spaces
    - Random scenarios for large input spaces
 9. **IMPORTANT**: DO NOT hard-code stimulus sequences as literal arrays. Use Python programming techniques to generate them dynamically.
 
@@ -433,7 +497,7 @@ def stimulus_gen():
     scenarios = []
 
     # Reset scenarios - NOTE: using "rst" because that's the signal name in module_header
-    for _ in range(5):
+    for _ in range(2):
         cycles = 5
         scenarios.append({{
             "clock_cycles": cycles,
@@ -443,7 +507,7 @@ def stimulus_gen():
         }})
 
     # Normal operation patterns - test different load patterns
-    for _ in range(15):
+    for _ in range(4):
         cycles = random.randint(10, 20)
         scenarios.append({{
             "clock_cycles": cycles,
@@ -464,7 +528,7 @@ def stimulus_gen():
         }})
 
     # Random scenarios - IMPORTANT: Generate many random cases for comprehensive testing
-    for _ in range(40):
+    for _ in range(8):
         cycles = random.randint(15, 30)
         scenarios.append({{
             "clock_cycles": cycles,
@@ -473,7 +537,7 @@ def stimulus_gen():
             "data_in": [format(random.getrandbits(8), '08b') for _ in range(cycles)]
         }})
 
-    # Total: 5 + 15 + 4 + 40 = 64 scenarios
+    # Total: 2 + 4 + 4 + 8 = 18 scenarios
     return scenarios
 ```
 
@@ -488,18 +552,18 @@ def stimulus_gen():
     return scenarios  # ❌ Only 1 scenario - this will fail testing!
 ```
 
-✓ **CORRECT** - Generate many test cases (50-100+):
+✓ **CORRECT** - Generate a bounded but diverse set:
 ```python
 def stimulus_gen():
     scenarios = []
-    # Reset cases (5-10)
-    for _ in range(5):
+    # Reset cases (2-4)
+    for _ in range(2):
         scenarios.append({{"clock_cycles": 5, "reset": ["1", "0", "0", "0", "0"]}})
-    # Normal operation (10-20)
-    for _ in range(15):
+    # Normal operation (3-8)
+    for _ in range(4):
         scenarios.append({{"clock_cycles": 10, "reset": ["0"] * 10}})
-    # Random cases (30-50)
-    for _ in range(40):
+    # Random cases (4-12)
+    for _ in range(8):
         cycles = random.randint(10, 20)
         reset_val = random.choice(["0", "1"])
         scenarios.append({{"clock_cycles": cycles, "reset": [reset_val] * cycles}})
@@ -615,6 +679,7 @@ import re
 import json
 import random
 import numpy as np
+import os
 """
 
 SEQ_TAIL = """
@@ -649,10 +714,24 @@ def extract_module_ports(verilog_file="top_module.v"):
         output_pattern = r'output\\s+(?:(?:wire|reg|logic)\\s+)?(?:\\[\\s*\\d+\\s*:\\s*\\d+\\s*\\])?\\s*(\\w+)'
         outputs = set(re.findall(output_pattern, port_list))
 
-        return {"inputs": inputs, "outputs": outputs}
+        widths = {}
+        width_pattern = r'\\b(input|output)\\s+(?:(?:wire|reg|logic)\\s+)?(?:\\[\\s*(\\d+)\\s*:\\s*(\\d+)\\s*\\]\\s*)?(\\w+)'
+        for _direction, msb, lsb, name in re.findall(width_pattern, port_list):
+            if msb and lsb:
+                widths[name] = abs(int(msb) - int(lsb)) + 1
+            else:
+                widths[name] = 1
+
+        return {"inputs": inputs, "outputs": outputs, "widths": widths}
     except Exception as e:
         print(f"Error extracting ports: {e}")
-        return {"inputs": set(), "outputs": set()}
+        return {"inputs": set(), "outputs": set(), "widths": {}}
+
+def resolve_verilog_file(preferred="module_code.v"):
+    for candidate in [preferred, "module_code.v", "top_module.v"]:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return preferred
 
 def fuzzy_match_signal(test_name, actual_signals):
     \"\"\"Fuzzy match test signal name to actual signal name.\"\"\"
@@ -725,8 +804,25 @@ def fix_stimulus_seq(stimulus_data, verilog_file="top_module.v"):
     ports = extract_module_ports(verilog_file)
     expected_inputs = ports["inputs"]  # Only INPUT signals (excluding clk) should be in stimulus
     expected_outputs = ports["outputs"]  # OUTPUT signals used for filtering only
+    widths = ports.get("widths", {})
     if not expected_inputs:
         return stimulus_data, ["Could not extract input ports"]
+
+    def normalize_value(value, width):
+        text = str(value).strip().replace("_", "")
+        if text.startswith(("0b", "0B")):
+            text = text[2:]
+        if not text or any(ch not in "01" for ch in text):
+            try:
+                text = format(int(str(value), 0), f"0{width}b")
+            except Exception:
+                text = "0" * width
+        if len(text) > width:
+            text = text[-width:]
+        elif len(text) < width:
+            text = text.zfill(width)
+        return text
+
     corrected_data, warnings = [], []
     for idx, scenario in enumerate(stimulus_data):
         if not isinstance(scenario, dict):
@@ -762,9 +858,10 @@ def fix_stimulus_seq(stimulus_data, verilog_file="top_module.v"):
             matched = fuzzy_match_signal(test_signal, expected_inputs)
             if matched:
                 if isinstance(values, list):
+                    values = [normalize_value(v, widths.get(matched, 1)) for v in values]
                     if len(values) < clock_cycles:
                         # Pad with zeros
-                        padded = values + ["0"] * (clock_cycles - len(values))
+                        padded = values + [normalize_value("0", widths.get(matched, 1))] * (clock_cycles - len(values))
                         corrected_scenario[matched] = padded
                         warnings.append(f"Scenario {idx}: Padded '{matched}' from {len(values)} to {clock_cycles} cycles")
                     elif len(values) > clock_cycles:
@@ -776,7 +873,7 @@ def fix_stimulus_seq(stimulus_data, verilog_file="top_module.v"):
                         corrected_scenario[matched] = values
                 else:
                     # Single value, convert to list
-                    corrected_scenario[matched] = [str(values)] * clock_cycles
+                    corrected_scenario[matched] = [normalize_value(values, widths.get(matched, 1))] * clock_cycles
                     warnings.append(f"Scenario {idx}: Converted single value '{matched}' to sequence")
             else:
                 warnings.append(f"Scenario {idx}: Signal '{test_signal}' not matched to any input, skipping")
@@ -793,18 +890,59 @@ def fix_stimulus_seq(stimulus_data, verilog_file="top_module.v"):
             # This handles cases where LLM completely missed the required signals
             warnings.append(f"Scenario {idx}: No valid signals found, adding all expected inputs with random sequences")
             for expected_signal in expected_inputs:
-                random_seq = [format(random.randint(0, 1), 'b') for _ in range(clock_cycles)]
+                width = widths.get(expected_signal, 1)
+                random_seq = [format(random.getrandbits(width), f"0{width}b") for _ in range(clock_cycles)]
                 corrected_scenario[expected_signal] = random_seq
 
         corrected_data.append(corrected_scenario)
     return corrected_data, warnings
+
+def cap_stimulus_seq(stimulus_data):
+    max_scenarios = int(os.environ.get("PRO_V_MAX_SEQ_SCENARIOS", "24"))
+    max_cycles = int(os.environ.get("PRO_V_MAX_SEQ_CYCLES", "32"))
+    max_total_cycles = int(os.environ.get("PRO_V_MAX_SEQ_TOTAL_CYCLES", "512"))
+    if not isinstance(stimulus_data, list):
+        return stimulus_data, []
+
+    capped, warnings, total_cycles = [], [], 0
+    for idx, scenario in enumerate(stimulus_data):
+        if len(capped) >= max_scenarios:
+            warnings.append(f"Dropped scenario {idx}: scenario cap {max_scenarios} reached")
+            continue
+        if not isinstance(scenario, dict):
+            continue
+
+        item = dict(scenario)
+        cycles = int(item.get("clock_cycles", 1) or 1)
+        if cycles > max_cycles:
+            warnings.append(f"Scenario {idx}: capped clock_cycles from {cycles} to {max_cycles}")
+            cycles = max_cycles
+            item["clock_cycles"] = cycles
+            for key, values in list(item.items()):
+                if key != "clock_cycles" and isinstance(values, list):
+                    item[key] = values[:cycles]
+
+        if total_cycles + cycles > max_total_cycles:
+            warnings.append(f"Dropped scenario {idx}: total cycle cap {max_total_cycles} reached")
+            continue
+
+        capped.append(item)
+        total_cycles += cycles
+
+    if len(capped) < len(stimulus_data):
+        warnings.append(f"Capped sequential stimulus from {len(stimulus_data)} to {len(capped)} scenarios")
+    return capped, warnings
 
 if __name__ == "__main__":
     import os
     import sys
     result = stimulus_gen()
     print("\\n=== Fixing and verifying stimulus ===")
-    fixed_result, warnings = fix_stimulus_seq(result, verilog_file="top_module.v")
+    verilog_file = resolve_verilog_file()
+    fixed_result, warnings = fix_stimulus_seq(result, verilog_file=verilog_file)
+    capped_result, cap_warnings = cap_stimulus_seq(fixed_result)
+    fixed_result = capped_result
+    warnings.extend(cap_warnings)
     if warnings:
         print("⚠ Warnings:")
         for w in warnings: print(f"  - {w}")
@@ -837,6 +975,8 @@ class GenTBAgent:
     def _generate_stimulus_prompt(self, problem_input: str, spec: str, circuit_type: str) -> str:
         """Generate prompt for stimulus generation"""
 
+        circuit_type = (circuit_type or "").strip().upper()
+
         if circuit_type == "CMB":
             prompt = CMB_SYSTEM_PROMPT + "\n\n" + CMB_GENERATION_PROMPT.format(
                 description=problem_input,
@@ -862,8 +1002,9 @@ class GenTBAgent:
         Returns:
             Dictionary with success status and file paths
         """
+        circuit_type = (circuit_type or "").strip().upper()
         logger.info(f"GenTBAgent.run started for circuit_type={circuit_type}")
-
+        
         # Track previous attempts for error feedback
         previous_code = None
         previous_error = None

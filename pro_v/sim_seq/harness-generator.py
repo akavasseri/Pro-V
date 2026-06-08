@@ -54,11 +54,12 @@ def extract_module_signals(verilog_file):
     for match in input_matches:
         msb, lsb, name = match
 
-        # Detect and save clock signal name (but don't add to regular inputs)
-        if name.lower() in ['clk', 'clock', 'rst', 'reset', 'rstn', 'rst_n']:
-            if name.lower() in ['clk', 'clock']:
-                signals["clock_name"] = name  # Save actual clock signal name
-                logger.info(f"Detected clock signal name: '{name}'")
+        # Detect and save clock signal name (but don't add to regular inputs).
+        # Reset-like ports are ordinary DUT inputs and must be driven by the
+        # generated harness; skipping them makes reset-sensitive tests false.
+        if name.lower() in ['clk', 'clock']:
+            signals["clock_name"] = name  # Save actual clock signal name
+            logger.info(f"Detected clock signal name: '{name}'")
             continue
         if msb and lsb:
             width = int(msb) - int(lsb) + 1

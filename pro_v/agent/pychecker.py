@@ -8,6 +8,7 @@ Architecture: Only __init__ and run methods.
 import json
 import logging
 import os
+import re
 import subprocess
 from typing import Dict, Any, Optional
 
@@ -45,6 +46,8 @@ You are implementing a Python class "GoldenDUT" for combinational logic.
 3. Output ONLY '0' and '1' binary strings - NEVER 'X', 'Z', 'd'
 4. Always mask outputs: `result & ((1 << width) - 1)`
 5. Multi-bit format: `format(result, f'0{{{{width}}}}b')`
+6. The returned dictionary MUST include every output signal from module_header on every call.
+7. Never return `{{}}`. If you are unsure, still compute the best reference behavior from the description and module header.
 
 ## Implementation
 
@@ -60,6 +63,7 @@ class GoldenDUT:
 ```
 
 **REMEMBER**: Output ONLY binary strings with '0' and '1'!
+**CRITICAL**: A GoldenDUT that returns empty expected outputs is invalid.
 """
 
 CMB_PythonHeader = """
@@ -69,6 +73,58 @@ import random
 import subprocess
 import os
 from typing import Dict, List, Union, Any
+
+def parse_module_ports_from_verilog(verilog_file="module_code.v"):
+    \"\"\"Best-effort parser for simple Verilog module port declarations.\"\"\"
+    try:
+        with open(verilog_file, "r") as f:
+            text = f.read()
+    except Exception as e:
+        print(f"Error reading Verilog for fallback port parsing: {e}")
+        return None
+
+    text = re.sub(r"//.*", "", text)
+    text = re.sub(r"/\\*.*?\\*/", "", text, flags=re.S)
+    ports = {"inputs": {}, "outputs": {}}
+
+    def add_port(direction, name, width):
+        name = name.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_$]*$", name):
+            return
+        if name.lower() in {"wire", "reg", "logic", "signed", "unsigned"}:
+            return
+        if any(keyword in name.lower() for keyword in ["clk", "clock"]):
+            return
+        ports["inputs" if direction == "input" else "outputs"][name] = width
+
+    single_decl = re.compile(
+        r"\\b(input|output)\\b\\s+"
+        r"(?:(?:wire|reg|logic|signed|unsigned)\\s+)*"
+        r"(?:\\[\\s*(\\d+)\\s*:\\s*(\\d+)\\s*\\]\\s*)?"
+        r"([A-Za-z_][A-Za-z0-9_$]*)"
+    )
+    for direction, msb, lsb, name in single_decl.findall(text):
+        width = abs(int(msb) - int(lsb)) + 1 if msb and lsb else 1
+        add_port(direction, name, width)
+
+    list_decl = re.compile(
+        r"\\b(input|output)\\b\\s+"
+        r"(?:(?:wire|reg|logic|signed|unsigned)\\s+)*"
+        r"(?:\\[\\s*(\\d+)\\s*:\\s*(\\d+)\\s*\\]\\s*)?"
+        r"([^;()]+);"
+    )
+    for direction, msb, lsb, names_blob in list_decl.findall(text):
+        if re.search(r"\\b(input|output)\\b", names_blob):
+            continue
+        width = abs(int(msb) - int(lsb)) + 1 if msb and lsb else 1
+        for raw_name in names_blob.split(","):
+            match = re.search(r"([A-Za-z_][A-Za-z0-9_$]*)", raw_name)
+            if match:
+                add_port(direction, match.group(1), width)
+
+    if not ports["inputs"] and not ports["outputs"]:
+        return None
+    return ports
 
 def extract_module_ports_with_yosys(verilog_file="module_code.v"):
     \"\"\"
@@ -97,7 +153,7 @@ write_json ports.json
 
         if result.returncode != 0:
             print(f"Yosys extraction failed: {result.stderr}")
-            return None
+            return parse_module_ports_from_verilog(verilog_file)
 
         # Parse the JSON output
         with open("ports.json", "r") as f:
@@ -127,7 +183,7 @@ write_json ports.json
         return ports
     except Exception as e:
         print(f"Error extracting ports with yosys: {e}")
-        return None
+        return parse_module_ports_from_verilog(verilog_file)
 
 def generate_random_stimulus(ports_info, num_vectors=10):
     \"\"\"
@@ -205,22 +261,64 @@ if __name__ == "__main__":
     test_vectors = verify_and_fix_stimulus(test_vectors, verilog_file="module_code.v")
     print("==============================================\\n")
 
+    ports_info = extract_module_ports_with_yosys("module_code.v")
+    if not ports_info or not ports_info.get("outputs"):
+        print("Error: could not extract output ports from module_code.v", file=sys.stderr)
+        sys.exit(1)
+
+    expected_outputs = ports_info["outputs"]
+
+    def validate_expected_outputs(output, context):
+        if not isinstance(output, dict) or not output:
+            raise ValueError(f"{context}: GoldenDUT returned empty/non-dict outputs")
+
+        cleaned = {}
+        for name, width in expected_outputs.items():
+            if name not in output:
+                raise ValueError(f"{context}: missing output '{name}'")
+            value = output[name]
+            if not isinstance(value, str):
+                raise ValueError(f"{context}: output '{name}' is not a string")
+            if len(value) != width or any(bit not in "01" for bit in value):
+                raise ValueError(
+                    f"{context}: output '{name}' expected {width} binary bits, got {value!r}"
+                )
+            cleaned[name] = value
+        return cleaned
+
     dut = GoldenDUT()
     testbench = []
+    errors = []
 
-    for test_vector in test_vectors:
+    for idx, test_vector in enumerate(test_vectors):
         try:
             output = dut.load(test_vector)
+            output = validate_expected_outputs(output, f"test vector {idx}")
             testbench.append({
                 "inputs": test_vector,
                 "expected_outputs": output
             })
+        except KeyError as e:
+            errors.append(
+                f"test vector {idx}: GoldenDUT accessed missing input/output key {e!r}; "
+                f"available input keys are {sorted(test_vector.keys())}"
+            )
         except Exception as e:
-            print(f"Error in test vector: {e}")
-            testbench.append({
-                "inputs": test_vector,
-                "expected_outputs": {}
-            })
+            errors.append(
+                f"test vector {idx}: {e}; available input keys are {sorted(test_vector.keys())}"
+            )
+
+    if errors:
+        print("Error: GoldenDUT failed to produce valid expected outputs.", file=sys.stderr)
+        for err in errors[:20]:
+            print(f"  - {err}", file=sys.stderr)
+        if len(errors) > 20:
+            print(f"  ... {len(errors) - 20} more errors", file=sys.stderr)
+        sys.exit(1)
+
+    if not testbench:
+        print("Error: no valid testbench entries generated", file=sys.stderr)
+        sys.exit(1)
 
     with open("testbench.json", "w") as f:
         json.dump(testbench, f, indent=2)
@@ -248,9 +346,35 @@ if __name__ == "__main__":
     test_scenarios = verify_and_fix_stimulus_seq(test_scenarios, verilog_file="module_code.v")
     print("==============================================\\n")
 
-    testbench = []
+    ports_info = extract_module_ports_with_yosys("module_code.v")
+    if not ports_info or not ports_info.get("outputs"):
+        print("Error: could not extract output ports from module_code.v", file=sys.stderr)
+        sys.exit(1)
 
-    for scenario in test_scenarios:
+    expected_outputs = ports_info["outputs"]
+
+    def validate_expected_outputs(output, context):
+        if not isinstance(output, dict) or not output:
+            raise ValueError(f"{context}: GoldenDUT returned empty/non-dict outputs")
+
+        cleaned = {}
+        for name, width in expected_outputs.items():
+            if name not in output:
+                raise ValueError(f"{context}: missing output '{name}'")
+            value = output[name]
+            if not isinstance(value, str):
+                raise ValueError(f"{context}: output '{name}' is not a string")
+            if len(value) != width or any(bit not in "01" for bit in value):
+                raise ValueError(
+                    f"{context}: output '{name}' expected {width} binary bits, got {value!r}"
+                )
+            cleaned[name] = value
+        return cleaned
+
+    testbench = []
+    errors = []
+
+    for scenario_idx, scenario in enumerate(test_scenarios):
         dut = GoldenDUT()
 
         clock_cycles = scenario.get("clock_cycles", 0)
@@ -263,25 +387,66 @@ if __name__ == "__main__":
             cycle_output = {}
             try:
                 rising_output = dut.load(1, cycle_inputs)
+                rising_output = validate_expected_outputs(
+                    rising_output, f"scenario {scenario_idx} cycle {cycle} rising edge"
+                )
                 cycle_output["rising_edge"] = rising_output
+            except KeyError as e:
+                errors.append(
+                    f"scenario {scenario_idx} cycle {cycle} rising edge: "
+                    f"GoldenDUT accessed missing input/output key {e!r}; "
+                    f"available input keys are {sorted(cycle_inputs.keys())}"
+                )
+                continue
             except Exception as e:
-                print(f"Error in rising edge cycle {cycle}: {e}")
-                cycle_output["rising_edge"] = {}
+                errors.append(
+                    f"scenario {scenario_idx} cycle {cycle} rising edge: {e}; "
+                    f"available input keys are {sorted(cycle_inputs.keys())}"
+                )
+                continue
 
             try:
                 falling_output = dut.load(0, cycle_inputs)
+                falling_output = validate_expected_outputs(
+                    falling_output, f"scenario {scenario_idx} cycle {cycle} falling edge"
+                )
                 cycle_output["falling_edge"] = falling_output
+            except KeyError as e:
+                errors.append(
+                    f"scenario {scenario_idx} cycle {cycle} falling edge: "
+                    f"GoldenDUT accessed missing input/output key {e!r}; "
+                    f"available input keys are {sorted(cycle_inputs.keys())}"
+                )
+                continue
             except Exception as e:
-                print(f"Error in falling edge cycle {cycle}: {e}")
-                cycle_output["falling_edge"] = {}
+                errors.append(
+                    f"scenario {scenario_idx} cycle {cycle} falling edge: {e}; "
+                    f"available input keys are {sorted(cycle_inputs.keys())}"
+                )
+                continue
 
             scenario_outputs.append(cycle_output)
+
+        if errors:
+            continue
 
         test_case = {"clock_cycles": clock_cycles}
         for sig_name, sig_values in input_signals.items():
             test_case[sig_name] = sig_values
         test_case["expected_outputs"] = scenario_outputs
         testbench.append(test_case)
+
+    if errors:
+        print("Error: GoldenDUT failed to produce valid expected outputs.", file=sys.stderr)
+        for err in errors[:20]:
+            print(f"  - {err}", file=sys.stderr)
+        if len(errors) > 20:
+            print(f"  ... {len(errors) - 20} more errors", file=sys.stderr)
+        sys.exit(1)
+
+    if not testbench:
+        print("Error: no valid testbench entries generated", file=sys.stderr)
+        sys.exit(1)
 
     with open("testbench.json", "w") as f:
         json.dump(testbench, f, indent=2)
@@ -322,6 +487,8 @@ You are implementing a Python class "GoldenDUT" for sequential logic.
    - inputs parameter contains INPUT signals (excluding 'clk')
    - Return dict should contain ONLY OUTPUT signals
    - Do NOT include input signals in return dict
+   - Return EVERY output signal from module_header on every call
+   - Never return `{{}}` for rising or falling edge
 
 **3. Bit Widths and Format**:
    - `[m:n]` → width = m-n+1, no range → 1 bit
@@ -356,6 +523,7 @@ class GoldenDUT:
 - Use EXACT signal names from module_header
 - Output ONLY binary strings with '0' and '1'
 - Access inputs dict with correct key names
+- Empty output dictionaries are invalid
 """
 
 SEQ_PythonHeader = """
@@ -365,6 +533,58 @@ import random
 import subprocess
 import os
 from typing import Dict, List, Union
+
+def parse_module_ports_from_verilog(verilog_file="module_code.v"):
+    \"\"\"Best-effort parser for simple Verilog module port declarations.\"\"\"
+    try:
+        with open(verilog_file, "r") as f:
+            text = f.read()
+    except Exception as e:
+        print(f"Error reading Verilog for fallback port parsing: {e}")
+        return None
+
+    text = re.sub(r"//.*", "", text)
+    text = re.sub(r"/\\*.*?\\*/", "", text, flags=re.S)
+    ports = {"inputs": {}, "outputs": {}}
+
+    def add_port(direction, name, width):
+        name = name.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_$]*$", name):
+            return
+        if name.lower() in {"wire", "reg", "logic", "signed", "unsigned"}:
+            return
+        if any(keyword in name.lower() for keyword in ["clk", "clock"]):
+            return
+        ports["inputs" if direction == "input" else "outputs"][name] = width
+
+    single_decl = re.compile(
+        r"\\b(input|output)\\b\\s+"
+        r"(?:(?:wire|reg|logic|signed|unsigned)\\s+)*"
+        r"(?:\\[\\s*(\\d+)\\s*:\\s*(\\d+)\\s*\\]\\s*)?"
+        r"([A-Za-z_][A-Za-z0-9_$]*)"
+    )
+    for direction, msb, lsb, name in single_decl.findall(text):
+        width = abs(int(msb) - int(lsb)) + 1 if msb and lsb else 1
+        add_port(direction, name, width)
+
+    list_decl = re.compile(
+        r"\\b(input|output)\\b\\s+"
+        r"(?:(?:wire|reg|logic|signed|unsigned)\\s+)*"
+        r"(?:\\[\\s*(\\d+)\\s*:\\s*(\\d+)\\s*\\]\\s*)?"
+        r"([^;()]+);"
+    )
+    for direction, msb, lsb, names_blob in list_decl.findall(text):
+        if re.search(r"\\b(input|output)\\b", names_blob):
+            continue
+        width = abs(int(msb) - int(lsb)) + 1 if msb and lsb else 1
+        for raw_name in names_blob.split(","):
+            match = re.search(r"([A-Za-z_][A-Za-z0-9_$]*)", raw_name)
+            if match:
+                add_port(direction, match.group(1), width)
+
+    if not ports["inputs"] and not ports["outputs"]:
+        return None
+    return ports
 
 def extract_module_ports_with_yosys(verilog_file="module_code.v"):
     \"\"\"
@@ -393,7 +613,7 @@ write_json ports.json
 
         if result.returncode != 0:
             print(f"Yosys extraction failed: {result.stderr}")
-            return None
+            return parse_module_ports_from_verilog(verilog_file)
 
         # Parse the JSON output
         with open("ports.json", "r") as f:
@@ -423,7 +643,7 @@ write_json ports.json
         return ports
     except Exception as e:
         print(f"Error extracting ports with yosys: {e}")
-        return None
+        return parse_module_ports_from_verilog(verilog_file)
 
 def generate_random_stimulus_seq(ports_info, num_scenarios=5, cycles_per_scenario=10):
     \"\"\"
@@ -620,6 +840,14 @@ class PyCheckerAgent:
                 "error": f"Failed to load stimulus.json: {e}"
             }
 
+        stimulus_input_keys = self._infer_stimulus_input_keys(stimulus_data)
+        expected_output_ports = self._extract_output_ports(header)
+        module_ports = {
+            "available_input_keys": stimulus_input_keys,
+            "required_output_ports": expected_output_ports
+        }
+        module_ports_prompt = json.dumps(module_ports, indent=2)
+
         # Track previous attempts for error feedback
         previous_code = None
         previous_error = None
@@ -641,6 +869,18 @@ class PyCheckerAgent:
                         description=description,
                         module_header=header
                     )
+
+                user_prompt += (
+                    "\n\n<module_ports>\n"
+                    f"{module_ports_prompt}\n"
+                    "</module_ports>\n"
+                    "Read inputs ONLY from available_input_keys. Return exactly the required_output_ports.\n"
+                    "If the description mentions other signal names that are not available_input_keys, treat them as external context and do not access them in inputs.\n"
+                    "\n\n<stimulus_sample>\n"
+                    f"{stimulus_sample}\n"
+                    "</stimulus_sample>\n"
+                    "Your GoldenDUT.load implementation must accept inputs with exactly this shape and must return all module output signals for every vector/scenario.\n"
+                )
 
                 # For retry attempts, append previous code and error information
                 if attempt > 0 and previous_code and previous_error:
@@ -747,6 +987,16 @@ class PyCheckerAgent:
                 with open(testbench_json_path, 'r') as f:
                     testbench_data = json.load(f)
 
+                quality_error = self._validate_testbench_quality(
+                    testbench_data=testbench_data,
+                    circuit_type=circuit_type,
+                    header=header
+                )
+                if quality_error:
+                    logger.warning(f"Attempt {attempt + 1} failed quality validation: {quality_error}")
+                    previous_error = quality_error
+                    continue
+
                 # Success!
                 logger.info(f"PyCheckerAgent.run succeeded on attempt {attempt + 1}")
                 return {
@@ -777,6 +1027,109 @@ class PyCheckerAgent:
             "error": f"Failed after {self.max_retries} attempts",
             "testbench_json_path": None
         }
+
+    def _extract_output_ports(self, header: str) -> Dict[str, int]:
+        """Extract output names and widths from a Verilog module header."""
+        outputs = {}
+        if not header:
+            return outputs
+
+        pattern = r'\boutput\s+(?:(?:wire|reg|logic)\s+)?(?:\[\s*(\d+)\s*:\s*(\d+)\s*\]\s*)?(\w+)'
+        for msb, lsb, name in re.findall(pattern, header):
+            if msb and lsb:
+                outputs[name] = abs(int(msb) - int(lsb)) + 1
+            else:
+                outputs[name] = 1
+        return outputs
+
+    def _infer_stimulus_input_keys(self, stimulus_data: Any) -> list:
+        """Infer concrete input keys from stimulus.json."""
+        keys = set()
+        if isinstance(stimulus_data, list):
+            for item in stimulus_data:
+                if isinstance(item, dict):
+                    keys.update(k for k in item.keys() if k != "clock_cycles")
+        elif isinstance(stimulus_data, dict):
+            keys.update(k for k in stimulus_data.keys() if k != "clock_cycles")
+        return sorted(keys)
+
+    def _binary_output_dict_is_valid(self, outputs: Any, expected_ports: Dict[str, int]) -> bool:
+        if not isinstance(outputs, dict) or not outputs:
+            return False
+
+        if expected_ports:
+            missing = set(expected_ports) - set(outputs)
+            if missing:
+                return False
+
+        for name, value in outputs.items():
+            if not isinstance(value, str) or not value:
+                return False
+            if any(ch not in "01" for ch in value):
+                return False
+            width = expected_ports.get(name)
+            if width is not None and len(value) != width:
+                return False
+        return True
+
+    def _seq_expected_outputs_are_valid(self, expected_outputs: Any, expected_ports: Dict[str, int]) -> bool:
+        if not isinstance(expected_outputs, list) or not expected_outputs:
+            return False
+
+        saw_real_output = False
+        for cycle_output in expected_outputs:
+            if not isinstance(cycle_output, dict):
+                return False
+            edge_dicts = []
+            for edge in ("rising_edge", "falling_edge"):
+                if edge in cycle_output:
+                    edge_dicts.append(cycle_output.get(edge))
+            if not edge_dicts:
+                return False
+            for edge_outputs in edge_dicts:
+                if self._binary_output_dict_is_valid(edge_outputs, expected_ports):
+                    saw_real_output = True
+                else:
+                    return False
+        return saw_real_output
+
+    def _validate_testbench_quality(
+        self,
+        testbench_data: Any,
+        circuit_type: str,
+        header: str
+    ) -> Optional[str]:
+        """Reject hollow testbenches that contain no meaningful expected outputs."""
+        if not isinstance(testbench_data, list) or not testbench_data:
+            return "testbench.json must be a non-empty list"
+
+        expected_ports = self._extract_output_ports(header)
+        if not expected_ports:
+            return "could not identify output ports from module_header"
+
+        bad = []
+        if circuit_type.lower() == "seq":
+            for idx, entry in enumerate(testbench_data):
+                if not isinstance(entry, dict):
+                    bad.append(f"{idx}: entry is not a dict")
+                    continue
+                if not self._seq_expected_outputs_are_valid(entry.get("expected_outputs"), expected_ports):
+                    bad.append(f"{idx}: missing/empty/invalid sequential expected_outputs")
+        else:
+            for idx, entry in enumerate(testbench_data):
+                if not isinstance(entry, dict):
+                    bad.append(f"{idx}: entry is not a dict")
+                    continue
+                if not self._binary_output_dict_is_valid(entry.get("expected_outputs"), expected_ports):
+                    bad.append(f"{idx}: missing/empty/invalid expected_outputs")
+
+        if bad:
+            preview = "; ".join(bad[:5])
+            return (
+                "Generated testbench is invalid because expected_outputs are empty, missing output "
+                f"signals, wrong width, or non-binary. Examples: {preview}"
+            )
+        return None
     
     def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
         """Call LLM to generate Python code
