@@ -4,19 +4,18 @@ set -Eeo pipefail
 ########################################
 # Config
 ########################################
-GPU_IDS="2,3"
-#MODEL_PATH="/home/nvidia/user/yujie/pychecker_rl/qwen_sft_output_pychecker/checkpoint-855"
-#SERVED_MODEL_NAME="/home/nvidia/user/yujie/pychecker_rl/qwen_sft_output_pychecker/checkpoint-361"
-MODEL_PATH="your model path"
-SERVED_MODEL_NAME=${MODEL_PATH}
-EXPERIMENT_NAME="qwen3_8b_non_think"
-MAX_LEN=36000
-PORT=8020
-TP_SIZE=2
-DP_SIZE=1
-MAX_CONCURRENCY=50
-TASK_NUMBERS=""
-VLLM_EXTRA=""
+GPU_IDS="0"
+MODEL_PATH="${MODEL_PATH:-./models/PRO-V-R1-8B}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-PRO-V-R1-8B}"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3_8b_non_think}"
+MAX_LEN="${MAX_LEN:-4096}"
+PORT="${PORT:-8020}"
+TP_SIZE="${TP_SIZE:-1}"
+DP_SIZE="${DP_SIZE:-1}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-50}"
+TASK_NUMBERS="${TASK_NUMBERS:-}"
+VLLM_EXTRA="${VLLM_EXTRA:-}"
 
 # Sampling settings
 TEMPERATURE=0
@@ -26,7 +25,8 @@ TOP_P_SAMPLE=0.95
 MAX_TOKEN=20000
 ENABLE_THINKING=true
 FILTER_INSTANCE=""
-FOLDER_PATH="./verilog-eval/HDLBits/test_benchmark_new.json"
+FOLDER_PATH="${FOLDER_PATH:-./verilog-eval/HDLBits/test_benchmark_new.json}"
+BENCHMARK_FORMAT="${BENCHMARK_FORMAT:-auto}"
 RUN_IDENTIFIER="gen_tb"
 KEY_CFG_PATH="../key.cfg"
 USE_GOLDEN_REF=true
@@ -39,17 +39,34 @@ DUT=false
 
 export TEMPERATURE TOP_P TEMPERATURE_SAMPLE TOP_P_SAMPLE MAX_TOKEN \
        ENABLE_THINKING FOLDER_PATH RUN_IDENTIFIER KEY_CFG_PATH USE_GOLDEN_REF \
-       SAMPLING_SIZE STIMULI_SAMPLING_SIZE MAX_TRIALS STAGE DAY DUT FILTER_INSTANCE
+       SAMPLING_SIZE STIMULI_SAMPLING_SIZE MAX_TRIALS STAGE DAY DUT FILTER_INSTANCE \
+       BENCHMARK_FORMAT
 
 ########################################
 # Setup
 ########################################
-PY=$(command -v python3 || command -v python)
-[[ -z "$PY" ]] && { echo "[ERROR] Python not found"; exit 1; }
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CHAT_TEMPLATE="${REPO_ROOT}/qwen3_nonthinking.jinja"
+cd "${REPO_ROOT}"
+
+PRO_V_ENV_PY="/scratch/network/ak7587/envs/pro-v/bin/python"
+if [[ -n "${PRO_V_PYTHON:-}" ]]; then
+  PY="${PRO_V_PYTHON}"
+elif [[ -x "${PRO_V_ENV_PY}" ]]; then
+  PY="${PRO_V_ENV_PY}"
+else
+  PY=$(command -v python3 || command -v python)
+fi
+[[ -z "$PY" ]] && { echo "[ERROR] Python not found"; exit 1; }
+
+if [[ -z "${CHAT_TEMPLATE}" ]]; then
+  CHAT_TEMPLATE="${REPO_ROOT}/qwen3_nonthinking.jinja"
+fi
+if [[ ! -f "${CHAT_TEMPLATE}" ]]; then
+  echo "[ERROR] Chat template not found: ${CHAT_TEMPLATE}" >&2
+  echo "[ERROR] Set CHAT_TEMPLATE=/path/to/qwen3_nonthinking.jinja or add it to the repo root." >&2
+  exit 1
+fi
 LOG_FILE="${REPO_ROOT}/vllm_${PORT}.log"
 
 IFS=',' read -r -a GPU_ARR <<< "${GPU_IDS}"
@@ -57,6 +74,29 @@ TOTAL_GPUS_NEEDED=$((TP_SIZE * DP_SIZE))
 [[ ${#GPU_ARR[@]} -lt $TOTAL_GPUS_NEEDED ]] && { echo "[ERROR] Not enough GPUs"; exit 1; }
 SELECTED_GPUS=("${GPU_ARR[@]:0:TOTAL_GPUS_NEEDED}")
 CUDA_DEVICES=$(IFS=','; echo "${SELECTED_GPUS[*]}")
+
+${PY} - <<'PY'
+import sys
+try:
+    import torch
+except Exception:
+    sys.exit(0)
+
+if not torch.cuda.is_available():
+    sys.exit(0)
+
+bad = []
+for idx in range(torch.cuda.device_count()):
+    major, minor = torch.cuda.get_device_capability(idx)
+    if (major, minor) < (7, 5):
+        bad.append(f"{idx}:{torch.cuda.get_device_name(idx)} cc{major}.{minor}")
+
+if bad:
+    print("[ERROR] This Python env has torch built for CUDA 13 and does not support V100/compute capability 7.0 GPUs.", file=sys.stderr)
+    print("[ERROR] Unsupported visible GPU(s): " + ", ".join(bad), file=sys.stderr)
+    print("[ERROR] Request an A100 job, for example: salloc --partition=gpu --gres=gpu:nvidia_a100:1 --time=02:00:00 --mem=32G", file=sys.stderr)
+    sys.exit(1)
+PY
 
 ########################################
 # Global variables
@@ -159,6 +199,8 @@ $PY pro_v/prompting_top_agent_simple.py \
   --model "$SERVED_MODEL_NAME" \
   --vllm_endpoints "$VLLM_ENDPOINTS_CSV" \
   --experiment_name "$EXPERIMENT_NAME" \
+  --benchmark_path "$FOLDER_PATH" \
+  --benchmark_format "$BENCHMARK_FORMAT" \
   --max_concurrency $MAX_CONCURRENCY \
   ${TASK_NUMBERS:+--task_numbers $TASK_NUMBERS} &
 

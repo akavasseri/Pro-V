@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pro_v.agent.gen_tb import GenTBAgent
 from pro_v.agent.pychecker import PyCheckerAgent
+from pro_v.benchmark_adapters import load_benchmark_tasks
 from pro_v.tools.pychecker_worker import get_ray_pychecker_worker_cls
 from pro_v.utils.llm_client import (
     create_llm_client_from_config,
@@ -50,24 +51,24 @@ def get_circuit_type(rtl_code: str) -> str:
         return "CMB"
 
 
-def load_benchmark_data(benchmark_path: str) -> Dict[int, Dict[str, Any]]:
+def load_benchmark_data(benchmark_path: str, benchmark_format: str = "auto") -> Dict[int, Dict[str, Any]]:
     """Load benchmark data from test_benchmark_new.json
 
     Args:
-        benchmark_path: Path to test_benchmark_new.json
+        benchmark_path: Path to HDLBits JSON or RTLLM folder
+        benchmark_format: auto, json/hdlbits_json, or rtllm_folder
 
     Returns:
         Dictionary mapping task_number to task data
     """
-    print(f"Loading benchmark data from: {benchmark_path}")
+    print(f"Loading benchmark data from: {benchmark_path} (format={benchmark_format})")
 
     if not os.path.exists(benchmark_path):
         print(f"ERROR: Benchmark file not found: {benchmark_path}")
         return {}
 
     try:
-        with open(benchmark_path, 'r') as f:
-            benchmark_list = json.load(f)
+        benchmark_list = load_benchmark_tasks(benchmark_path, benchmark_format)
 
         # Create mapping from task_number to task data
         task_map = {}
@@ -289,6 +290,8 @@ def main():
     parser.add_argument("--benchmark_path", type=str,
                         default="verilog-eval/HDLBits/test_benchmark_new.json",
                         help="Path to benchmark file")
+    parser.add_argument("--benchmark_format", type=str, default="auto",
+                        help="Benchmark format: auto, hdlbits_json, or rtllm_folder")
     parser.add_argument("--max_concurrency", type=int, default=8,
                         help="Maximum number of tasks to process concurrently (default: auto-detect GPUs, max 100)")
     parser.add_argument("--use_gpu_workers", action="store_true",
@@ -307,7 +310,7 @@ def main():
     print(f"{'='*70}\n")
 
     # Load benchmark data first
-    benchmark_data = load_benchmark_data(args.benchmark_path)
+    benchmark_data = load_benchmark_data(args.benchmark_path, args.benchmark_format)
 
     if not benchmark_data:
         print("ERROR: Failed to load benchmark data. Exiting.")

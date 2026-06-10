@@ -48,6 +48,11 @@ log_*/
 output_*/
 *.log
 
+# Local experiment assets
+models/
+verilog-eval/
+*.bak_*
+
 # API Keys and Secrets
 key.cfg
 *.key
@@ -106,4 +111,3 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
-

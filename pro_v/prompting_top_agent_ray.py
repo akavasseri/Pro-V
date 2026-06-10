@@ -804,16 +804,20 @@ class TaskWorker:
                 )
 
             if os.path.exists(benchmark_file_path):
-                with open(benchmark_file_path, 'r') as f:
-                    raw_benchmark = json.load(f)
-
-                # CHANGED: handle both dict and list formats (same as load_benchmark_data)
-                if isinstance(raw_benchmark, dict):
-                    benchmark_data = [raw_benchmark]
-                elif isinstance(raw_benchmark, list):
-                    benchmark_data = raw_benchmark
+                benchmark_format = os.environ.get("BENCHMARK_FORMAT", "auto")
+                if os.path.isdir(benchmark_file_path):
+                    benchmark_data = load_benchmark_tasks(benchmark_file_path, benchmark_format)
                 else:
-                    benchmark_data = []
+                    with open(benchmark_file_path, 'r') as f:
+                        raw_benchmark = json.load(f)
+
+                    # CHANGED: handle both dict and list formats (same as load_benchmark_data)
+                    if isinstance(raw_benchmark, dict):
+                        benchmark_data = [raw_benchmark]
+                    elif isinstance(raw_benchmark, list):
+                        benchmark_data = raw_benchmark
+                    else:
+                        benchmark_data = []
 
                 # Find this task in benchmark
                 task_benchmark = None
@@ -1097,7 +1101,7 @@ class TaskWorker:
             shutil.copy(testbench_json_path, os.path.join(sample_eval_dir, "testbench.json"))
 
             env = os.environ.copy()
-            env["PATH"] = f"/scratch/network/ak7587/envs/pro-v/bin:{env.get('PATH', '')}"
+            env["PATH"] = f"{os.path.dirname(sys.executable)}:{env.get('PATH', '')}"
 
             hgen_proc = subprocess.run(
                 [sys.executable, "harness-generator.py"],
@@ -1463,7 +1467,7 @@ class TaskWorker:
             json.dump(placeholder_data, f, indent=2)
 
         env = os.environ.copy()
-        env["PATH"] = f"/scratch/network/ak7587/envs/pro-v/bin:{env.get('PATH', '')}"
+        env["PATH"] = f"{os.path.dirname(sys.executable)}:{env.get('PATH', '')}"
 
         try:
             hgen_proc = subprocess.run(

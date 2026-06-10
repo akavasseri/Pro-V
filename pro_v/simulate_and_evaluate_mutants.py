@@ -5,6 +5,8 @@ Simplified Parallel Simulation and Evaluation System for Mutant Detection
 
 import json
 import logging
+import os
+import shutil
 import subprocess
 import re
 from pathlib import Path
@@ -13,6 +15,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+
+# Template directories for harness regeneration
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+SIM_CMB_TEMPLATE_DIR = os.path.join(_THIS_DIR, "sim_cmb")
+SIM_SEQ_TEMPLATE_DIR = os.path.join(_THIS_DIR, "sim_seq")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,7 +85,8 @@ class EvaluationMetrics:
         )
 
 
-def run_simulation(module_code: str, sim_dir: Path, timeout: int = 60) -> SimulationResult:
+def run_simulation(module_code: str, sim_dir: Path, timeout: int = 60,
+                   testbench_path: Optional[str] = None, sim_template_dir: Optional[str] = None) -> SimulationResult:
     """
     Run simulation by replacing module and running make
 
@@ -86,6 +94,8 @@ def run_simulation(module_code: str, sim_dir: Path, timeout: int = 60) -> Simula
         module_code: Verilog module code to test
         sim_dir: Existing simulation directory
         timeout: Simulation timeout in seconds
+        testbench_path: Path to testbench JSON; if provided, regenerates rfuzz-harness.cpp
+        sim_template_dir: Path to sim template dir containing harness-generator.py
 
     Returns:
         SimulationResult
@@ -96,6 +106,30 @@ def run_simulation(module_code: str, sim_dir: Path, timeout: int = 60) -> Simula
     module_file = sim_dir / "top_module.v"
     with open(module_file, 'w') as f:
         f.write(module_code)
+
+    # Regenerate rfuzz-harness.cpp if a testbench path is provided
+    if testbench_path and sim_template_dir:
+        # Copy framework files (including harness-generator.py)
+        for fname in ["Makefile", "input.vc", "sim-main.cpp", "rfuzz-harness.h", "harness-generator.py"]:
+            src = os.path.join(sim_template_dir, fname)
+            if os.path.exists(src):
+                shutil.copy(src, sim_dir)
+
+        # Write testbench.json for the harness generator
+        if os.path.exists(testbench_path):
+            shutil.copy(testbench_path, os.path.join(sim_dir, "testbench.json"))
+        else:
+            with open(os.path.join(sim_dir, "testbench.json"), 'w') as f:
+                json.dump([], f)
+
+        # Regenerate harness
+        subprocess.run(
+            ["python3", "harness-generator.py"],
+            cwd=sim_dir,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
 
     # Clean previous build
     subprocess.run("make clean", shell=True, cwd=sim_dir, capture_output=True, timeout=10)
@@ -205,10 +239,14 @@ def evaluate_single_task(task_data: Dict, experiment_dir: Path, mutant_only: boo
     task_result_path = task_dir / "task_result.json"
 
     sim_type = "cmb"
+    selected_testbench_path = None
     if task_result_path.exists():
         with open(task_result_path, 'r') as f:
             task_result = json.load(f)
             sim_type = task_result.get('circuit_type', 'cmb').lower()
+            selected_testbench_path = task_result.get('selected_testbench_path')
+
+    sim_template_dir = SIM_SEQ_TEMPLATE_DIR if sim_type == "seq" else SIM_CMB_TEMPLATE_DIR
 
     sim_dir = task_dir / f"sim_{sim_type}"
     if not sim_dir.exists():
@@ -219,7 +257,8 @@ def evaluate_single_task(task_data: Dict, experiment_dir: Path, mutant_only: boo
 
     module_code = task_data['module_code']
     mutants = task_data.get('mutants', [])
-    expected_results = task_data.get('result', [])
+    raw_result = task_data.get("result", [])
+    expected_results = [not x for x in raw_result]  # now True = should pass
 
     metrics.total_mutants = len(mutants)
     metrics.expected_mutant_results = expected_results
@@ -227,7 +266,9 @@ def evaluate_single_task(task_data: Dict, experiment_dir: Path, mutant_only: boo
     # Test module_code (skip if mutant_only)
     if not mutant_only:
         logger.info(f"[Task #{task_number}] Testing module_code...")
-        result = run_simulation(module_code, sim_dir, timeout=timeout)
+        result = run_simulation(module_code, sim_dir, timeout=timeout,
+                                testbench_path=selected_testbench_path,
+                                sim_template_dir=sim_template_dir)
 
         metrics.compile_success = result.compile_success
         metrics.module_passes = result.passed
@@ -246,13 +287,28 @@ def evaluate_single_task(task_data: Dict, experiment_dir: Path, mutant_only: boo
         logger.info(f"[Task #{task_number}] Skipping module_code testing (mutant_only mode)")
         metrics.compile_success = True
         metrics.module_passes = True
+        # Still regenerate harness so mutant simulations compile correctly
+        if selected_testbench_path and sim_template_dir:
+            for fname in ["Makefile", "input.vc", "sim-main.cpp", "rfuzz-harness.h", "harness-generator.py"]:
+                src = os.path.join(sim_template_dir, fname)
+                if os.path.exists(src):
+                    shutil.copy(src, sim_dir)
+            if os.path.exists(selected_testbench_path):
+                shutil.copy(selected_testbench_path, os.path.join(sim_dir, "testbench.json"))
+            else:
+                with open(os.path.join(sim_dir, "testbench.json"), 'w') as f:
+                    json.dump([], f)
+            subprocess.run(
+                ["python3", "harness-generator.py"],
+                cwd=sim_dir, capture_output=True, text=True, timeout=30
+            )
 
     # Test mutants (only if module passed)
     logger.info(f"[Task #{task_number}] Testing {len(mutants)} mutants...")
     for i, mutant_code in enumerate(mutants):
         logger.info(f"[Task #{task_number}] Simulating mutant #{i+1}/{len(mutants)}...")
 
-        mutant_result = run_simulation(mutant_code, sim_dir, timeout=timeout)
+        mutant_result = run_simulation(mutant_code, sim_dir, timeout=timeout)  # harness already regenerated above
 
         # Save log
         if mutant_result.stdout:
@@ -532,8 +588,7 @@ def main():
 
     # Run evaluation
     results = evaluate_all_tasks(
-        #benchmark_file="verilog-eval/HDLBits/test_benchmark_new.json",
-        benchmark_file="verilog-eval/HDLBits/merged_benchmark.json",
+        benchmark_file="verilog-eval/HDLBits/test_benchmark_new.json",
         experiment_dir=args.experiment_dir,
         mutant_only=args.mutant_only,
         limit=args.limit,

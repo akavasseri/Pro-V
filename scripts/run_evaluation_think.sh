@@ -9,6 +9,7 @@ GPU_IDS="0"
 
 MODEL_PATH="./models/PRO-V-R1-8B"
 SERVED_MODEL_NAME="PRO-V-R1-8B"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
 
 EXPERIMENT_NAME="verilog_eval_$(date +%Y%m%d_%H%M%S)"
 
@@ -71,6 +72,15 @@ elif command -v python >/dev/null 2>&1; then
   PY=python
 else
   echo "[ERROR] Python not found. Please install python3 or adjust PATH." >&2
+  exit 1
+fi
+
+if [[ -z "${CHAT_TEMPLATE}" ]]; then
+  CHAT_TEMPLATE="${REPO_ROOT}/qwen3_nonthinking.jinja"
+fi
+if [[ ! -f "${CHAT_TEMPLATE}" ]]; then
+  echo "[ERROR] Chat template not found: ${CHAT_TEMPLATE}" >&2
+  echo "[ERROR] Set CHAT_TEMPLATE=/path/to/qwen3_nonthinking.jinja or add it to the repo root." >&2
   exit 1
 fi
 
@@ -241,7 +251,7 @@ launch_replica() {
       --tensor-parallel-size "${TP_SIZE}" \
       --max-model-len "${MAX_LEN}" \
       --port "${port}" \
-      --chat-template /scratch/network/ak7587/Pro-V/qwen3_nonthinking.jinja \
+      --chat-template "${CHAT_TEMPLATE}" \
       ${VLLM_EXTRA} \
       >"${log_file}" 2>&1
   ) &

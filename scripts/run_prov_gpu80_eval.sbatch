@@ -5,16 +5,16 @@
 #SBATCH --constraint=gpu80
 #SBATCH --mem=64G
 #SBATCH --time=06:00:00
-#SBATCH --output=/scratch/network/ak7587/Pro-V/logs/prov_gpu80_eval_%j.out
-#SBATCH --error=/scratch/network/ak7587/Pro-V/logs/prov_gpu80_eval_%j.err
+#SBATCH --output=logs/prov_gpu80_eval_%j.out
+#SBATCH --error=logs/prov_gpu80_eval_%j.err
 
 set -Eeuo pipefail
 
-cd /scratch/network/ak7587/Pro-V
+cd "${PRO_V_REPO_ROOT:-/scratch/network/ak7587/Pro-V}"
 mkdir -p logs
 
-export PRO_V_PYTHON=/scratch/network/ak7587/envs/pro-v/bin/python
-export PATH="/scratch/network/ak7587/envs/pro-v/bin:${PATH}"
+export PRO_V_PYTHON="${PRO_V_PYTHON:-/scratch/network/ak7587/envs/pro-v/bin/python}"
+export PATH="$(dirname "${PRO_V_PYTHON}"):${PATH}"
 export PRO_V_MAX_CMB_VECTORS="${PRO_V_MAX_CMB_VECTORS:-100}"
 export PRO_V_MAX_SEQ_SCENARIOS="${PRO_V_MAX_SEQ_SCENARIOS:-24}"
 export PRO_V_MAX_SEQ_CYCLES="${PRO_V_MAX_SEQ_CYCLES:-32}"

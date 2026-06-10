@@ -48,11 +48,14 @@ Progressive improvements by adding PRO-V Flow, SFT, and RL to the base model:
 
 ## 🚀 Quick Start
 
+For the experiment scripts and benchmark adapters used on this branch, see
+[`docs/REPRODUCING.md`](docs/REPRODUCING.md).
+
 ### Step 1: Environment Setup
 
 ```bash
 # Clone the repository
-git clone https://github.com/YourRepo/PRO-V.git
+git clone https://github.com/akavasseri/Pro-V.git
 cd PRO-V
 
 # Create conda environment
@@ -110,7 +113,7 @@ bash run_evaluation_think.sh
 ### 1.> Install the Repository
 
 ```bash
-git clone https://github.com/YourRepo/PRO-V.git
+git clone https://github.com/akavasseri/Pro-V.git
 cd PRO-V
 
 # Get submodules (benchmark datasets)
