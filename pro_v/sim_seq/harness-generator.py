@@ -348,6 +348,19 @@ def main():
 
                     corrected_cycle = {}
 
+                    # Handle pre_clock outputs (after inputs are applied while clock is low)
+                    pre_clock_outputs = cycle_outputs.get("pre_clock")
+                    if isinstance(pre_clock_outputs, dict):
+                        corrected_cycle["pre_clock"] = {}
+                        for test_signal, value in pre_clock_outputs.items():
+                            matched_signal = fuzzy_match_signal(test_signal, actual_signals["outputs"])
+                            if matched_signal:
+                                corrected_cycle["pre_clock"][matched_signal] = value
+                            else:
+                                logger.warning(f"Output signal '{test_signal}' not matched at cycle {cycle_idx}, skipping")
+                    elif pre_clock_outputs not in (None, {}):
+                        logger.warning(f"Unexpected pre_clock format at cycle {cycle_idx}, skipping (type={type(pre_clock_outputs).__name__})")
+
                     # Handle rising_edge outputs
                     rising_outputs = cycle_outputs.get("rising_edge")
                     if isinstance(rising_outputs, dict):
@@ -526,6 +539,59 @@ int fuzz_poke() {
             cpp_code += f"""    // Evaluate with inputs set (clock still low)\n"""
             cpp_code += f"""    top_{scenario_idx}_ptr->eval();\n"""
             cpp_code += f"""    \n"""
+
+            # Check outputs before clock edge (needed for asynchronous controls)
+            if "pre_clock" in expected_outputs[cycle]:
+                cpp_code += f"""    // Check outputs before clock edge\n"""
+                for name, value in expected_outputs[cycle]["pre_clock"].items():
+                    temp = sanitize_value(value)
+                    
+                    if any(c not in '01' for c in temp.lower()):
+                        cpp_code += f"""    printf("  Pre-clock output {name}: expected=0b{temp} (skipped - contains x/z/unknown)\\n");\n"""
+                        continue
+
+                    actual_width = actual_signals["outputs"].get(name, len(temp))
+
+                    if len(temp) < actual_width:
+                        temp = temp.zfill(actual_width)
+                    elif len(temp) > actual_width:
+                        temp = temp[-actual_width:]
+
+                    hex_len = (len(temp) + 3) // 4
+                    hex_value = hex(int(temp, 2))[2:].zfill(hex_len)
+
+                    if actual_width <= 64:
+                        cpp_code += f"""    printf("  Pre-clock output {name}: expected(from JSON)=0x{hex_value}, actual(from sim)=0x%llx\\n", (unsigned long long)top_{scenario_idx}_ptr->{name});\n"""
+                        cpp_code += f"""    if (top_{scenario_idx}_ptr->{name} != 0x{hex_value}) {{\n"""
+                        cpp_code += f"""        unpass++;\n"""
+                        cpp_code += f"""        printf("  [FAIL] Mismatch at {name} (pre-clock) in cycle {cycle}\\n");\n"""
+                        cpp_code += f"""    }} else {{\n"""
+                        cpp_code += f"""        printf("  [PASS] {name} matched (pre-clock)\\n");\n"""
+                        cpp_code += f"""    }}\n"""
+                    else:
+                        n_words = wide_output_signals[name]
+
+                        padded = temp.zfill(n_words * 32)
+                        chunks = [
+                            int(padded[-32 * (k + 1): -32 * k or None], 2)
+                            for k in range(n_words)
+                        ]
+
+                        for k, c in enumerate(chunks):
+                            cpp_code += f"""    {name}_wide[{k}] = 0x{c:08X}u;\n"""
+
+                        cpp_code += f"""    printf("  Pre-clock output {name} (wide):\\n");\n"""
+                        cpp_code += f"""    bool {name}_pre_clock_match_s{scenario_idx}_c{cycle} = true;\n"""
+                        for k in range(n_words):
+                            cpp_code += f"""    printf("    [{k}] expected(from JSON)=0x%08X, actual(from sim)=0x%08X\\n", {name}_wide[{k}], top_{scenario_idx}_ptr->{name}[{k}]);\n"""
+                            cpp_code += f"""    if (top_{scenario_idx}_ptr->{name}[{k}] != {name}_wide[{k}]) {name}_pre_clock_match_s{scenario_idx}_c{cycle} = false;\n"""
+
+                        cpp_code += f"""    if (!{name}_pre_clock_match_s{scenario_idx}_c{cycle}) {{\n"""
+                        cpp_code += f"""        unpass++;\n"""
+                        cpp_code += f"""        printf("  [FAIL] Mismatch at {name} (pre-clock) in cycle {cycle}\\n");\n"""
+                        cpp_code += f"""    }} else {{\n"""
+                        cpp_code += f"""        printf("  [PASS] {name} matched (pre-clock)\\n");\n"""
+                        cpp_code += f"""    }}\n"""
             
             # Rising edge: clk 0->1
             cpp_code += f"""    // Rising edge: 0->1\n"""

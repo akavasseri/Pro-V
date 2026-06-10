@@ -275,14 +275,20 @@ def fix_stimulus(stimulus_data, verilog_file="top_module.v"):
     - Filters out any OUTPUT signals (they should NOT be in stimulus)
     - Adds missing input signals with random values
     \"\"\"
-    if not stimulus_data or not isinstance(stimulus_data, list):
-        return stimulus_data, ["Stimulus is empty or invalid"]
     ports = extract_module_ports(verilog_file)
     expected_inputs = ports["inputs"]  # Only INPUT signals should be in stimulus
     expected_outputs = ports["outputs"]  # OUTPUT signals used for filtering only
     widths = ports.get("widths", {})
     if not expected_inputs:
-        return stimulus_data, ["Could not extract input ports"]
+        if not expected_outputs:
+            return stimulus_data, ["Could not extract input or output ports"]
+        # A no-input combinational module still needs one vector so the RTL
+        # oracle can observe the constant output.
+        if not isinstance(stimulus_data, list) or not stimulus_data:
+            return [{}], ["No input ports; using one empty stimulus vector"]
+        return [{} for _ in stimulus_data], ["No input ports; cleared stimulus inputs"]
+    if not stimulus_data or not isinstance(stimulus_data, list):
+        return stimulus_data, ["Stimulus is empty or invalid"]
 
     def normalize_value(value, width):
         text = str(value).strip().replace("_", "")
@@ -325,8 +331,17 @@ def fix_stimulus(stimulus_data, verilog_file="top_module.v"):
         corrected_data.append(corrected_vector)
     return corrected_data, warnings
 
-def cap_stimulus(stimulus_data):
+def cap_stimulus(stimulus_data, verilog_file="top_module.v"):
     max_vectors = int(os.environ.get("PRO_V_MAX_CMB_VECTORS", "100"))
+    ports = extract_module_ports(verilog_file)
+    inputs = ports.get("inputs", set())
+    widths = ports.get("widths", {})
+    total_bits = sum(int(widths.get(name, 1) or 1) for name in inputs)
+    exhaustive_bits = int(os.environ.get("PRO_V_EXHAUSTIVE_CMB_BITS", "10"))
+    if inputs and total_bits <= exhaustive_bits:
+        max_vectors = max(max_vectors, 1 << total_bits)
+    elif any(name.lower() in ("sel", "select", "selector") for name in inputs):
+        max_vectors = max(max_vectors, int(os.environ.get("PRO_V_MAX_MUX_VECTORS", "256")))
     if not isinstance(stimulus_data, list) or len(stimulus_data) <= max_vectors:
         return stimulus_data, []
 
@@ -349,6 +364,86 @@ def cap_stimulus(stimulus_data):
 
     return selected[:max_vectors], [f"Capped combinational stimulus from {len(stimulus_data)} to {max_vectors} vectors"]
 
+def enrich_small_comb_stimulus(stimulus_data, verilog_file="top_module.v"):
+    # Use exhaustive vectors for small combinational input spaces.
+    if not isinstance(stimulus_data, list):
+        return stimulus_data, []
+
+    ports = extract_module_ports(verilog_file)
+    inputs = sorted(ports.get("inputs", []))
+    widths = ports.get("widths", {})
+    if not inputs:
+        return stimulus_data, []
+
+    total_bits = sum(int(widths.get(name, 1) or 1) for name in inputs)
+    exhaustive_bits = int(os.environ.get("PRO_V_EXHAUSTIVE_CMB_BITS", "10"))
+    if total_bits > exhaustive_bits:
+        return stimulus_data, []
+
+    vectors = []
+    for value in range(1 << total_bits):
+        cursor = total_bits
+        vector = {}
+        for name in inputs:
+            width = int(widths.get(name, 1) or 1)
+            cursor -= width
+            vector[name] = format((value >> cursor) & ((1 << width) - 1), f"0{width}b")
+        vectors.append(vector)
+
+    return vectors, [f"Using exhaustive combinational stimulus: {len(vectors)} vectors for {total_bits} input bits"]
+
+def enrich_mux_comb_stimulus(stimulus_data, verilog_file="top_module.v"):
+    # Add selector-focused coverage for larger mux-like combinational modules.
+    if not isinstance(stimulus_data, list):
+        return stimulus_data, []
+
+    ports = extract_module_ports(verilog_file)
+    inputs = sorted(ports.get("inputs", []))
+    widths = ports.get("widths", {})
+    selectors = [name for name in inputs if name.lower() in ("sel", "select", "selector")]
+    data_inputs = [
+        name for name in inputs
+        if name not in selectors and (
+            name.lower().startswith("data") or name.lower() in {"a", "b", "c", "d", "e", "f", "g", "h", "i"}
+        )
+    ]
+    if not selectors or not data_inputs:
+        return stimulus_data, []
+
+    enriched = list(stimulus_data)
+    seen = {json.dumps(v, sort_keys=True) for v in enriched if isinstance(v, dict)}
+
+    def bits(value, width):
+        return format(value & ((1 << width) - 1), f"0{width}b")
+
+    for sel in selectors:
+        sel_width = int(widths.get(sel, 1) or 1)
+        for sel_value in range(1 << sel_width):
+            for pattern_idx in range(4):
+                vector = {}
+                for name in inputs:
+                    width = int(widths.get(name, 1) or 1)
+                    if name == sel:
+                        vector[name] = bits(sel_value, width)
+                    elif name in data_inputs:
+                        if pattern_idx == 0:
+                            value = 0
+                        elif pattern_idx == 1:
+                            value = (1 << width) - 1
+                        elif pattern_idx == 2:
+                            value = (sel_value + 1) * (data_inputs.index(name) + 1)
+                        else:
+                            value = int(("10" * ((width + 1) // 2))[:width], 2)
+                        vector[name] = bits(value, width)
+                    else:
+                        vector[name] = "0" * width
+                key = json.dumps(vector, sort_keys=True)
+                if key not in seen:
+                    seen.add(key)
+                    enriched.append(vector)
+
+    return enriched, [f"Added selector-focused mux stimulus; total vectors now {len(enriched)}"]
+
 if __name__ == "__main__":
     import os
     import sys
@@ -356,7 +451,11 @@ if __name__ == "__main__":
     print("\\n=== Fixing and verifying stimulus ===")
     verilog_file = resolve_verilog_file()
     fixed_result, warnings = fix_stimulus(result, verilog_file=verilog_file)
-    capped_result, cap_warnings = cap_stimulus(fixed_result)
+    fixed_result, exhaustive_warnings = enrich_small_comb_stimulus(fixed_result, verilog_file=verilog_file)
+    warnings.extend(exhaustive_warnings)
+    fixed_result, mux_warnings = enrich_mux_comb_stimulus(fixed_result, verilog_file=verilog_file)
+    warnings.extend(mux_warnings)
+    capped_result, cap_warnings = cap_stimulus(fixed_result, verilog_file=verilog_file)
     fixed_result = capped_result
     warnings.extend(cap_warnings)
     if warnings:

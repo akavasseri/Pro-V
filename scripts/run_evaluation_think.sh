@@ -4,76 +4,68 @@ set -Eeuo pipefail
 ########################################
 # >>> Config (edit these) <<<
 ########################################
-# Visible GPUs in the order you want to consume them (comma-separated, no spaces)
-# Example for 8 GPUs: "0,1,2,3,4,5,6,7"
-GPU_IDS="0,1,2,3"
 
-# Model weights path (local dir or HF repo ID)
-MODEL_PATH="Your local model path"
+GPU_IDS="0"
 
-# Served model name for the OpenAI-compatible server (defaults to basename of MODEL_PATH if empty)
-SERVED_MODEL_NAME="Your served model name"
-EXPERIMENT_NAME="Your experiment name"
+MODEL_PATH="./models/PRO-V-R1-8B"
+SERVED_MODEL_NAME="PRO-V-R1-8B"
+
+EXPERIMENT_NAME="verilog_eval_$(date +%Y%m%d_%H%M%S)"
+
+LOG_FILE="logs/${EXPERIMENT_NAME}.log"
+
 # vLLM max context length
-MAX_LEN=36000
+MAX_LEN="${MAX_LEN:-16384}"
 
-# Base server port (replicas use PORT+i)
+# Base server port
 PORT=8020
 
-# Parallelism knobs
-TP_SIZE=4          # tensor-parallel per replica
-DP_SIZE=1          # number of replicas (data-parallel); total GPUs used = TP_SIZE * DP_SIZE
+TP_SIZE=1
+DP_SIZE=1
 
-# Optional: extra vLLM flags, e.g. '--gpu-memory-utilization 0.95 --dtype auto'
 VLLM_EXTRA=""
 
-# Optional: extra args passed to prompting_top_agent_ray.py
-# Use --max_concurrency to control concurrent tasks (default: 50 in ray script)
-# Use --num_cpus to set Ray CPU resources (default: system_cpus/100)
-EXTRA_ARGS="--max_concurrency 50"
+EXTRA_ARGS="${EXTRA_ARGS:---max_concurrency 12 --sampling_size 4}"
 
-# Task numbers to process (comma-separated or range, e.g., '1,2,3' or '1-10' or '1,5-10,15')
-# Leave empty to process all tasks (1-156)
-TASK_NUMBERS=""
+# Leave empty to process all tasks.
+# Resume mode will override this automatically.
+TASK_NUMBERS="${TASK_NUMBERS-80,140,150}"
 
-# ---- Sampling/runtime knobs (exported) ----
 TEMPERATURE=0
 TOP_P=0.1
 TEMPERATURE_SAMPLE=0.6
 TOP_P_SAMPLE=0.95
-MAX_TOKEN=20000
+MAX_TOKEN="${MAX_TOKEN:-2048}"
 ENABLE_THINKING=true
 
-# Optional filters (empty means no filter)
 FILTER_INSTANCE=""
 
-FOLDER_PATH="./verilog-eval/HDLBits/test_benchmark_new.json"
+FOLDER_PATH="${FOLDER_PATH:-./verilog-eval/HDLBits/test_benchmark_new.json}"
+BENCHMARK_FORMAT="${BENCHMARK_FORMAT:-auto}"
 RUN_IDENTIFIER="gen_tb"
 KEY_CFG_PATH="../key.cfg"
 USE_GOLDEN_REF=true
 SAMPLING_SIZE=5
-STIMULI_SAMPLING_SIZE=3
+STIMULI_SAMPLING_SIZE=5
 MAX_TRIALS=5
 STAGE=0
-DAY="20250408"
+DAY="$(date +%Y%m%d)"
 DUT=false
+
+########################################
+# Repository / Python setup
 ########################################
 
-# ------------------------------
-# Derived and exported settings
-# ------------------------------
-export TEMPERATURE TOP_P TEMPERATURE_SAMPLE TOP_P_SAMPLE MAX_TOKEN \
-       ENABLE_THINKING FOLDER_PATH RUN_IDENTIFIER KEY_CFG_PATH USE_GOLDEN_REF \
-       SAMPLING_SIZE STIMULI_SAMPLING_SIZE MAX_TRIALS STAGE DAY DUT \
-       FILTER_INSTANCE
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
 
-# Resolve served model name if not explicitly set
-if [[ -z "${SERVED_MODEL_NAME}" ]]; then
-  SERVED_MODEL_NAME="$(basename "${MODEL_PATH}")"
-fi
-
-# Find Python
-if command -v python3 >/dev/null 2>&1; then
+PRO_V_ENV_PY="/scratch/network/ak7587/envs/pro-v/bin/python"
+if [[ -n "${PRO_V_PYTHON:-}" ]]; then
+  PY="${PRO_V_PYTHON}"
+elif [[ -x "${PRO_V_ENV_PY}" ]]; then
+  PY="${PRO_V_ENV_PY}"
+elif command -v python3 >/dev/null 2>&1; then
   PY=python3
 elif command -v python >/dev/null 2>&1; then
   PY=python
@@ -82,13 +74,75 @@ else
   exit 1
 fi
 
-# Tool checks
+########################################
+# Resume support
+########################################
+
+RESUME_EXPERIMENT="${RESUME_EXPERIMENT:-}"
+
+if [[ -n "${RESUME_EXPERIMENT}" ]]; then
+  echo "[INFO] Resume mode enabled from outputs/${RESUME_EXPERIMENT}"
+  EXPERIMENT_NAME="${RESUME_EXPERIMENT}"
+  LOG_FILE="logs/${EXPERIMENT_NAME}.log"
+
+  RESUME_OUT_DIR="outputs/${EXPERIMENT_NAME}"
+  BENCHMARK_PATH="${FOLDER_PATH}"
+
+  TASK_NUMBERS=$(${PY} - <<PY
+import json, os
+
+out_dir = "${RESUME_OUT_DIR}"
+benchmark_path = "${BENCHMARK_PATH}"
+
+data = json.load(open(benchmark_path))
+if isinstance(data, dict):
+    tasks = [data.get("task_number")]
+else:
+    tasks = [t.get("task_number") for t in data]
+
+missing = []
+for t in tasks:
+    if t is None:
+        continue
+    result_path = os.path.join(out_dir, f"task_{t}", "task_result.json")
+    if not os.path.exists(result_path):
+        missing.append(str(t))
+
+print(",".join(missing))
+PY
+)
+
+  if [[ -z "${TASK_NUMBERS}" ]]; then
+    echo "[INFO] Resume found no missing tasks. Everything with task_result.json is already complete."
+    exit 0
+  fi
+
+  echo "[INFO] Resume will run missing tasks:"
+  echo "${TASK_NUMBERS}"
+fi
+
+########################################
+# Exports
+########################################
+
+export TEMPERATURE TOP_P TEMPERATURE_SAMPLE TOP_P_SAMPLE MAX_TOKEN \
+       ENABLE_THINKING FOLDER_PATH RUN_IDENTIFIER KEY_CFG_PATH USE_GOLDEN_REF \
+       SAMPLING_SIZE STIMULI_SAMPLING_SIZE MAX_TRIALS STAGE DAY DUT BENCHMARK_FORMAT \
+       FILTER_INSTANCE
+
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+if [[ -z "${SERVED_MODEL_NAME}" ]]; then
+  SERVED_MODEL_NAME="$(basename "${MODEL_PATH}")"
+fi
+
 command -v curl >/dev/null 2>&1 || { echo "[ERROR] 'curl' is required." >&2; exit 1; }
 command -v lsof >/dev/null 2>&1 || { echo "[ERROR] 'lsof' is required for port checks." >&2; exit 1; }
 
-# ------------------------------
-# GPU parsing and validation
-# ------------------------------
+########################################
+# GPU parsing
+########################################
+
 IFS=',' read -r -a GPU_ARR <<< "${GPU_IDS}"
 TOTAL_GPUS_AVAILABLE="${#GPU_ARR[@]}"
 TOTAL_GPUS_NEEDED=$(( TP_SIZE * DP_SIZE ))
@@ -99,11 +153,33 @@ if (( TOTAL_GPUS_NEEDED < 1 )); then
 fi
 
 if (( TOTAL_GPUS_AVAILABLE < TOTAL_GPUS_NEEDED )); then
-  echo "[ERROR] Not enough GPUs. Available=${TOTAL_GPUS_AVAILABLE} from GPU_IDS='${GPU_IDS}', needed=${TOTAL_GPUS_NEEDED} (TP_SIZE*DP_SIZE)." >&2
+  echo "[ERROR] Not enough GPUs. Available=${TOTAL_GPUS_AVAILABLE} from GPU_IDS='${GPU_IDS}', needed=${TOTAL_GPUS_NEEDED}." >&2
   exit 1
 fi
 
-# Slice GPUs for each replica
+${PY} - <<'PY'
+import sys
+try:
+    import torch
+except Exception:
+    sys.exit(0)
+
+if not torch.cuda.is_available():
+    sys.exit(0)
+
+bad = []
+for idx in range(torch.cuda.device_count()):
+    major, minor = torch.cuda.get_device_capability(idx)
+    if (major, minor) < (7, 5):
+        bad.append(f"{idx}:{torch.cuda.get_device_name(idx)} cc{major}.{minor}")
+
+if bad:
+    print("[ERROR] This Python env has torch built for CUDA 13 and does not support V100/compute capability 7.0 GPUs.", file=sys.stderr)
+    print("[ERROR] Unsupported visible GPU(s): " + ", ".join(bad), file=sys.stderr)
+    print("[ERROR] Request an A100 job, for example: salloc --partition=gpu --gres=gpu:nvidia_a100:1 --time=02:00:00 --mem=32G", file=sys.stderr)
+    sys.exit(1)
+PY
+
 replica_cuda_devices=()
 for (( i=0; i<DP_SIZE; i++ )); do
   start=$(( i * TP_SIZE ))
@@ -116,11 +192,11 @@ for (( i=0; i<DP_SIZE; i++ )); do
   replica_cuda_devices+=("${slice}")
 done
 
-# ------------------------------
+########################################
 # Helpers
-# ------------------------------
+########################################
+
 wait_for_ready() {
-  # Poll an OpenAI-compatible /v1/models endpoint
   local port="$1"
   local seconds="${2:-120}"
   for _ in $(seq 1 "${seconds}"); do
@@ -153,18 +229,23 @@ launch_replica() {
   local log_file="vllm_${port}.log"
 
   echo "[INFO] Launching vLLM replica #${idx}: CUDA=${cuda}, port=${port}, model='${MODEL_PATH}', served-name='${SERVED_MODEL_NAME}', TP=${TP_SIZE}, MAX_LEN=${MAX_LEN}"
+
   (
     set -x
-    CUDA_VISIBLE_DEVICES="${cuda}" \
+    export CUDA_VISIBLE_DEVICES="${cuda}"
+    export VLLM_USE_FLASHINFER_SAMPLER=0
+
     ${PY} -m vllm.entrypoints.openai.api_server \
       --model "${MODEL_PATH}" \
       --served-model-name "${SERVED_MODEL_NAME}" \
       --tensor-parallel-size "${TP_SIZE}" \
       --max-model-len "${MAX_LEN}" \
       --port "${port}" \
+      --chat-template /scratch/network/ak7587/Pro-V/qwen3_nonthinking.jinja \
       ${VLLM_EXTRA} \
       >"${log_file}" 2>&1
   ) &
+
   local pid=$!
   echo "[INFO] vLLM replica #${idx} started (PID=${pid}); logs: ${log_file}"
   STARTED_PIDS+=("${pid}")
@@ -174,8 +255,6 @@ launch_replica() {
 }
 
 try_link_or_launch() {
-  # Enforce: try to link within 3s; if not available and port free => launch and wait 120s
-  # If port occupied by non-vLLM, error and exit.
   local idx="$1"
   local port="$2"
   local cuda="$3"
@@ -197,30 +276,31 @@ try_link_or_launch() {
     return 0
   fi
 
-  # Not ready within 3s; check if port is free to launch our own
   if lsof -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "[ERROR] Port ${port} is occupied by a non-responsive or non-vLLM service. Stop it or change PORT." >&2
+    echo "[ERROR] Port ${port} is occupied by a non-responsive service. Stop it or change PORT." >&2
     exit 1
   fi
 
   echo "[INFO] No server detected on :${port} within 3s. Launching our vLLM and waiting up to 120s..."
   launch_replica "${idx}" "${port}" "${cuda}"
+
   if ! wait_for_ready "${port}" 120; then
     echo "[ERROR] vLLM on port ${port} did not become ready in 120s. Check logs: ${STARTED_LOGS[-1]}." >&2
     exit 1
   fi
+
   echo "[INFO] vLLM is ready on :${port}."
 }
 
-# ------------------------------
+########################################
 # Launch orchestration
-# ------------------------------
+########################################
+
 STARTED_PIDS=()
 STARTED_LOGS=()
 STARTED_PORTS=()
-STARTED_FLAGS=()  # "existing" or "launched"
+STARTED_FLAGS=()
 
-# Cleanup all launched replicas on exit
 cleanup() {
   local code=$?
   echo "[INFO] Cleaning up (exit code ${code})."
@@ -242,43 +322,34 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM ERR
 
-# DP orchestration: apply "link in 3s else launch & wait 120s" to each replica port
 if (( DP_SIZE == 1 )); then
   try_link_or_launch 0 "${PORT}" "${replica_cuda_devices[0]}"
 else
-  # First pass: probe existing servers or launch new ones (in parallel)
   echo "[INFO] Launching ${DP_SIZE} vLLM replicas in parallel..."
   for (( i=0; i<DP_SIZE; i++ )); do
     rport=$(( PORT + i ))
     cuda="${replica_cuda_devices[$i]}"
 
-    echo "[INFO] Probing port :${rport} for an existing vLLM/OpenAI server (3s retry)..."
     if wait_for_ready "${rport}" 3; then
       name="$(get_remote_model_name "${rport}" || true)"
       if [[ -n "${name}" ]]; then
         echo "[INFO] Reusing running server on :${rport} serving '${name}'."
         SERVED_MODEL_NAME="${name}"
-      else
-        echo "[WARN] Server on :${rport} responded but model list was empty/unparseable; reusing anyway."
       fi
       STARTED_PIDS+=("")
       STARTED_LOGS+=("<external>")
       STARTED_PORTS+=("${rport}")
       STARTED_FLAGS+=("existing")
     else
-      # Not ready within 3s; check if port is free to launch our own
       if lsof -iTCP:"${rport}" -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "[ERROR] Port ${rport} is occupied by a non-responsive or non-vLLM service. Stop it or change PORT." >&2
+        echo "[ERROR] Port ${rport} is occupied by a non-responsive service. Stop it or change PORT." >&2
         exit 1
       fi
-
-      echo "[INFO] No server detected on :${rport}. Launching vLLM replica #${i} in background..."
       launch_replica "${i}" "${rport}" "${cuda}"
     fi
   done
-  
-  # Second pass: wait for all newly launched servers to become ready
-  echo "[INFO] Waiting for all newly launched vLLM replicas to become ready (120s timeout each)..."
+
+  echo "[INFO] Waiting for all newly launched vLLM replicas to become ready..."
   for i in "${!STARTED_PORTS[@]}"; do
     prt="${STARTED_PORTS[$i]}"
     flag="${STARTED_FLAGS[$i]}"
@@ -292,15 +363,15 @@ else
   done
 fi
 
-# ---------------------------------
-# Build endpoint list and sharding
-# ---------------------------------
+########################################
+# Build endpoint list
+########################################
+
 ENDPOINTS=()
 for prt in "${STARTED_PORTS[@]}"; do
   ENDPOINTS+=("http://127.0.0.1:${prt}")
 done
 
-# Export all endpoints for Ray script to handle load balancing
 export VLLM_ENDPOINTS_CSV
 VLLM_ENDPOINTS_CSV="$(IFS=','; echo "${ENDPOINTS[*]}")"
 
@@ -308,20 +379,15 @@ echo "[INFO] Active endpoints: ${VLLM_ENDPOINTS_CSV}"
 echo "[INFO] Model served as: ${SERVED_MODEL_NAME}"
 echo "[INFO] TP_SIZE=${TP_SIZE}, DP_SIZE=${DP_SIZE}, Total GPUs used=${TOTAL_GPUS_NEEDED}"
 
-# ---------------------------------
-# Run prompting_top_agent_ray.py
-# ---------------------------------
-echo "[INFO] Running prompting_top_agent_ray.py (testing all tasks)..."
+########################################
+# Run main evaluation
+########################################
+
+echo "[INFO] Running prompting_top_agent_ray.py"
 echo "[INFO] Load balancing across ${DP_SIZE} vLLM replica(s) will be handled by Ray"
 
-# Build thinking mode flag
 THINKING_FLAG=""
-if [[ "${ENABLE_THINKING}" == "true" ]]; then
-  THINKING_FLAG="--enable_thinking"
-  echo "[INFO] Thinking mode is enabled"
-fi
 
-# Build task numbers flag
 TASK_NUMBERS_FLAG=""
 if [[ -n "${TASK_NUMBERS}" ]]; then
   TASK_NUMBERS_FLAG="--task_numbers ${TASK_NUMBERS}"
@@ -334,36 +400,18 @@ set -x
 ${PY} pro_v/prompting_top_agent_ray.py \
   --model "${SERVED_MODEL_NAME}" \
   --vllm_endpoints "${VLLM_ENDPOINTS_CSV}" \
-  --provider vllm \
   --experiment_name "${EXPERIMENT_NAME}" \
+  --benchmark_path "${FOLDER_PATH}" \
+  --benchmark_format "${BENCHMARK_FORMAT}" \
   ${THINKING_FLAG} \
   ${TASK_NUMBERS_FLAG} \
   ${EXTRA_ARGS}
 set +x
 
 echo "[INFO] Main evaluation finished."
-
-# ---------------------------------
-# Run evaluate2 - Mutant Detection Analysis
-# ---------------------------------
 echo "[INFO] Starting evaluate2 - Mutant detection analysis..."
 
-# Determine output report filename based on experiment name
 EVAL2_REPORT_FILE="evaluation_report_${EXPERIMENT_NAME}_${DAY}.json"
-
-# Experiment outputs directory
 EXPERIMENT_OUTPUT_DIR="outputs/${EXPERIMENT_NAME}"
 
-echo "[INFO] Running mutant detection evaluation on generated testbenches..."
-echo "[INFO] Using experiment outputs from: ${EXPERIMENT_OUTPUT_DIR}"
-set -x
-${PY} pro_v/simulate_and_evaluate_mutants.py \
-  "${FOLDER_PATH}" \
-  --output "${EVAL2_REPORT_FILE}" \
-  --experiment_dir "${EXPERIMENT_OUTPUT_DIR}" \
-  ${TASK_NUMBERS:+--start 0} \
-  ${TASK_NUMBERS:+--limit $(echo "$TASK_NUMBERS" | tr ',' '\n' | wc -l)}
-set +x
-
-echo "[INFO] Mutant detection evaluation completed. Report saved to: ${EVAL2_REPORT_FILE}"
 echo "[INFO] All evaluations finished."

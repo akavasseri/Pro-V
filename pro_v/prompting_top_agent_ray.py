@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pro_v.agent.gen_tb import GenTBAgent
 from pro_v.agent.pychecker import PyCheckerAgent
+from pro_v.benchmark_adapters import load_benchmark_tasks, write_normalized_benchmark
 from pro_v.utils.llm_client import (
     create_llm_client_from_config,
     create_pychecker_llm_client_from_config
@@ -236,47 +237,31 @@ def judge_pychecker_samples(
     }
 
 
-def load_benchmark_data(benchmark_path: str) -> Dict[int, Dict[str, Any]]:
-    """Load benchmark data from test_benchmark_new.json
+def load_benchmark_data(benchmark_path: str, benchmark_format: str = "auto") -> Dict[int, Dict[str, Any]]:
+    """Load benchmark data through the adapter layer.
 
     Args:
-        benchmark_path: Path to test_benchmark_new.json
+        benchmark_path: Path to JSON benchmark file or RTLLM root directory
+        benchmark_format: auto, json/hdlbits_json, or rtllm_folder
 
     Returns:
-        Dictionary mapping task_number to task data containing:
-        - task_id: Task identifier
-        - task_number: Task number
-        - description: Problem description
-        - header: Module header
-        - module_code: Full RTL module code
-        - mutants: List of mutant codes (optional)
+        Dictionary mapping task_number to normalized task data.
     """
-    print(f"Loading benchmark data from: {benchmark_path}")
+    print(f"Loading benchmark data from: {benchmark_path} (format={benchmark_format})")
 
     if not os.path.exists(benchmark_path):
         print(f"ERROR: Benchmark file not found: {benchmark_path}")
         return {}
 
     try:
-        with open(benchmark_path, 'r') as f:
-            benchmark_list = json.load(f)
-
-        # CHANGED: handle both dict (single task) and list formats
+        benchmark_entries = load_benchmark_tasks(benchmark_path, benchmark_format)
         task_map = {}
-        if isinstance(benchmark_list, dict):
-            benchmark_entries = [benchmark_list]
-        elif isinstance(benchmark_list, list):
-            benchmark_entries = benchmark_list
-        else:
-            print(f"ERROR: Unexpected benchmark format: {type(benchmark_list)}")
-            return {}
-
         for task in benchmark_entries:
             task_number = task.get("task_number") if isinstance(task, dict) else None
             if task_number is not None:
                 task_map[task_number] = task
 
-        print(f"Loaded {len(task_map)} tasks from benchmark")
+        print(f"Loaded {len(task_map)} normalized tasks from benchmark")
         return task_map
 
     except Exception as e:
@@ -1015,6 +1000,10 @@ class TaskWorker:
                                     print(f"    80%: {'✓ PASSED' if simulation_metrics['eval2_mutant_detection']['agreement_80'] else '✗ FAILED'}")
                                     print(f"    90%: {'✓ PASSED' if simulation_metrics['eval2_mutant_detection']['agreement_90'] else '✗ FAILED'}")
                                     print(f"   100%: {'✓ PASSED' if simulation_metrics['eval2_mutant_detection']['agreement_100'] else '✗ FAILED'}")
+                                else:
+                                    simulation_metrics["eval2_mutant_detection"]["skipped"] = True
+                                    simulation_metrics["eval2_mutant_detection"]["agreement_rate"] = None
+                                    print("  eval2: SKIPPED - no mutants/labels in benchmark")
 
                             else:
                                 print(f"  eval0: ✗ FAILED - Compilation error")
@@ -1033,10 +1022,12 @@ class TaskWorker:
                                 pass
 
                     # Calculate overall success
+                    eval2_info = simulation_metrics["eval2_mutant_detection"]
+                    eval2_ok = eval2_info.get("agreement_80") or eval2_info.get("skipped")
                     simulation_metrics["overall_success"] = (
                         simulation_metrics["eval0_compile_success"] and
                         simulation_metrics["eval1_module_passes"] and
-                        simulation_metrics["eval2_mutant_detection"]["agreement_80"]
+                        bool(eval2_ok)
                     )
                     print(f"  Overall success: {'✓ PASSED' if simulation_metrics['overall_success'] else '✗ FAILED'}")
 
@@ -1285,12 +1276,13 @@ class TaskWorker:
             return
 
         if circuit_type.lower() == "seq":
-            if cycle is None or edge not in ("rising_edge", "falling_edge"):
+            if cycle is None or edge not in ("pre_clock", "rising_edge", "falling_edge"):
                 return
             scenario = testbench_data[index]
             scenario_outputs = scenario.setdefault("expected_outputs", [])
             while len(scenario_outputs) <= cycle:
                 scenario_outputs.append({
+                    "pre_clock": self._zero_output_dict(output_widths),
                     "rising_edge": self._zero_output_dict(output_widths),
                     "falling_edge": self._zero_output_dict(output_widths),
                 })
@@ -1357,7 +1349,7 @@ class TaskWorker:
                 continue
 
             m = re.search(
-                r"^\s*(Rising edge output|Falling edge output|Output)\s+([A-Za-z_][A-Za-z0-9_$]*):"
+                r"^\s*(Pre-clock output|Rising edge output|Falling edge output|Output)\s+([A-Za-z_][A-Za-z0-9_$]*):"
                 r"\s*expected\(from JSON\)=0x[0-9a-fA-F]+,\s*actual\(from sim\)=0x([0-9a-fA-F]+)",
                 line,
             )
@@ -1365,7 +1357,9 @@ class TaskWorker:
                 flush_wide()
                 kind, name, actual_hex = m.groups()
                 edge = None
-                if kind.startswith("Rising"):
+                if kind.startswith("Pre-clock"):
+                    edge = "pre_clock"
+                elif kind.startswith("Rising"):
                     edge = "rising_edge"
                 elif kind.startswith("Falling"):
                     edge = "falling_edge"
@@ -1380,14 +1374,16 @@ class TaskWorker:
                 continue
 
             m = re.search(
-                r"^\s*(Rising edge output|Falling edge output|Output)\s+([A-Za-z_][A-Za-z0-9_$]*)\s+\(wide\):",
+                r"^\s*(Pre-clock output|Rising edge output|Falling edge output|Output)\s+([A-Za-z_][A-Za-z0-9_$]*)\s+\(wide\):",
                 line,
             )
             if m and current_index is not None:
                 flush_wide()
                 kind, name = m.groups()
                 edge = None
-                if kind.startswith("Rising"):
+                if kind.startswith("Pre-clock"):
+                    edge = "pre_clock"
+                elif kind.startswith("Rising"):
                     edge = "rising_edge"
                 elif kind.startswith("Falling"):
                     edge = "falling_edge"
@@ -1439,10 +1435,11 @@ class TaskWorker:
         placeholder_data = json.loads(json.dumps(testbench_data))
         zeros = self._zero_output_dict(output_widths)
         if circuit_type.lower() == "seq":
+            include_pre_clock = self._seq_uses_pre_clock_checks(rtl_code)
             for scenario in placeholder_data:
                 cycles = int(scenario.get("clock_cycles", 0) or 0)
                 scenario["expected_outputs"] = [
-                    {"rising_edge": dict(zeros), "falling_edge": dict(zeros)}
+                    self._seq_expected_output_template(output_widths, include_pre_clock)
                     for _ in range(cycles)
                 ]
         else:
@@ -1517,12 +1514,19 @@ class TaskWorker:
         except Exception as exc:
             return False, f"failed to load stimulus: {exc}", None, None
 
-        if not isinstance(stimulus_data, list) or not stimulus_data:
-            return False, "stimulus is not a non-empty list", None, None
-
         output_widths = self._extract_output_widths_from_verilog(rtl_code)
         if not output_widths:
             return False, "could not extract output widths from RTL", None, None
+
+        if not isinstance(stimulus_data, list):
+            return False, "stimulus is not a list", None, None
+        if not stimulus_data and circuit_type.lower() == "cmb":
+            input_widths = self._extract_input_widths_from_verilog(rtl_code)
+            if input_widths:
+                return False, "stimulus is empty", None, None
+            stimulus_data = [{}]
+        elif not stimulus_data:
+            return False, "stimulus is empty", None, None
 
         stimulus_data = self._augment_direct_stimulus(stimulus_data, circuit_type, rtl_code)
 
@@ -1530,6 +1534,7 @@ class TaskWorker:
         testbench_data = []
 
         if circuit_type.lower() == "seq":
+            include_pre_clock = self._seq_uses_pre_clock_checks(rtl_code)
             self._complete_seq_inputs_from_rtl(stimulus_data, rtl_code)
             for scenario in stimulus_data:
                 if not isinstance(scenario, dict):
@@ -1556,7 +1561,7 @@ class TaskWorker:
                     else:
                         entry[name] = [str(values)] * clock_cycles
                 entry["expected_outputs"] = [
-                    {"rising_edge": dict(zeros), "falling_edge": dict(zeros)}
+                    self._seq_expected_output_template(output_widths, include_pre_clock)
                     for _ in range(clock_cycles)
                 ]
                 testbench_data.append(entry)
@@ -1587,6 +1592,63 @@ class TaskWorker:
 
         return True, f"created {len(testbench_data)} stimulus entries", golden_path, testbench_path
 
+    def _classify_resets_from_verilog(self, rtl_code: str) -> Dict[str, Dict[str, Any]]:
+        """Infer reset polarity and async/sync behavior from always sensitivity lists."""
+        text = re.sub(r"//.*", "", rtl_code or "")
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        input_widths = self._extract_input_widths_from_verilog(text)
+
+        resets = {}
+        for name in input_widths:
+            lname = name.lower()
+            if lname in ("reset", "rst", "areset", "arst", "rst_n", "resetn", "aresetn", "arst_n") or "reset" in lname:
+                resets[name] = {
+                    "kind": "sync",
+                    "active_low": lname.endswith("n") or lname.endswith("_n") or lname.endswith("resetn"),
+                }
+
+        if not resets:
+            return resets
+
+        for sensitivity in re.findall(r"always\s*@\s*\((.*?)\)", text, flags=re.S | re.I):
+            tokens = re.findall(
+                r"\b(posedge|negedge)?\s*([A-Za-z_][A-Za-z0-9_$]*)",
+                sensitivity,
+                flags=re.I,
+            )
+            edge_signals = {sig for edge, sig in tokens if edge}
+            if len(edge_signals) < 2:
+                continue
+            for edge, sig in tokens:
+                if sig in resets:
+                    resets[sig]["kind"] = "async"
+                    if edge.lower() == "negedge":
+                        resets[sig]["active_low"] = True
+                    elif edge.lower() == "posedge":
+                        resets[sig]["active_low"] = False
+
+        return resets
+
+    def _seq_uses_pre_clock_checks(self, rtl_code: str) -> bool:
+        """Only async-reset sequential circuits need before-edge checks."""
+        return any(
+            info.get("kind") == "async"
+            for info in self._classify_resets_from_verilog(rtl_code).values()
+        )
+
+    def _seq_expected_output_template(
+        self,
+        output_widths: Dict[str, int],
+        include_pre_clock: bool = False,
+    ) -> Dict[str, Dict[str, str]]:
+        zeros = self._zero_output_dict(output_widths)
+        template = {}
+        if include_pre_clock:
+            template["pre_clock"] = dict(zeros)
+        template["rising_edge"] = dict(zeros)
+        template["falling_edge"] = dict(zeros)
+        return template
+
     def _augment_direct_stimulus(self, stimulus_data: List[Any], circuit_type: str, rtl_code: str = "") -> List[Any]:
         """Add deterministic, bounded scenarios that expose common sequential mutants."""
         if circuit_type.lower() != "seq" or not stimulus_data:
@@ -1609,6 +1671,10 @@ class TaskWorker:
             return None
 
         reset = find_signal("reset", "areset", "rst", "rst_n", "resetn")
+        reset_meta = self._classify_resets_from_verilog(rtl_code)
+        if not reset and reset_meta:
+            reset = next((name for name in reset_meta if name in keys), None)
+        reset_info = reset_meta.get(reset, {}) if reset else {}
         data = find_signal("data")
         d = find_signal("d")
         in_sig = find_signal("in")
@@ -1625,7 +1691,7 @@ class TaskWorker:
             if not reset:
                 return None
             lname = reset.lower()
-            active_low = lname.endswith("n") or lname.endswith("_n")
+            active_low = bool(reset_info.get("active_low", lname.endswith("n") or lname.endswith("_n")))
             asserted = "0" if active_low else "1"
             released = "1" if active_low else "0"
             values = [released] * cycles
@@ -1633,6 +1699,28 @@ class TaskWorker:
                 if 0 <= idx < cycles:
                     values[idx] = asserted
             return values
+
+        def add_reset_scenario(name, cycles, asserted_at, seed=0):
+            if not reset:
+                return
+            scenario = {"clock_cycles": cycles, reset: reset_values(cycles, asserted_at=asserted_at)}
+            for key in keys:
+                if key == reset:
+                    continue
+                scenario[key] = self._deterministic_input_values(
+                    key, input_widths.get(key, 1), cycles, seed
+                )
+            augmented.append(scenario)
+
+        # Async resets must be observable while the clock is still low. Sync resets
+        # are checked on clock edges with reset asserted beside changing data.
+        if reset:
+            if reset_info.get("kind") == "async":
+                add_reset_scenario("async_reset_midcycle", 8, asserted_at=(0, 3, 6), seed=11)
+                add_reset_scenario("async_reset_release", 8, asserted_at=(0, 1, 4), seed=12)
+            else:
+                add_reset_scenario("sync_reset_edges", 8, asserted_at=(0, 3, 4), seed=13)
+                add_reset_scenario("sync_reset_release", 8, asserted_at=(0,), seed=14)
 
         # Wide state machines generate enormous logs because every cycle prints
         # many 32-bit chunks. Keep them compact but still include load/boundary cases.
@@ -1787,21 +1875,20 @@ class ProVTopAgent:
         print(f"Starting Pro-V Evaluation: {self.args.experiment_name}")
         print(f"{'='*70}\n")
 
-        # Determine which tasks to process
-        if self.args.task_numbers:
-            task_numbers = [int(t.strip()) for t in self.args.task_numbers.split(',')]
-        else:
-            task_numbers = list(range(1, 157))  # All tasks 1-156
-
-        print(f"Processing {len(task_numbers)} tasks: {task_numbers[:10]}{'...' if len(task_numbers) > 10 else ''}")
-
-        # CHANGED: use args.benchmark_path instead of hardcoded env var
         benchmark_path = self.args.benchmark_path
-        benchmark_data = load_benchmark_data(benchmark_path)
+        benchmark_data = load_benchmark_data(benchmark_path, self.args.benchmark_format)
 
         if not benchmark_data:
             print("ERROR: Failed to load benchmark data. Exiting.")
             return {"error": "Failed to load benchmark data"}
+
+        # Determine which tasks to process
+        if self.args.task_numbers:
+            task_numbers = [int(t.strip()) for t in self.args.task_numbers.split(',')]
+        else:
+            task_numbers = sorted(benchmark_data.keys())
+
+        print(f"Processing {len(task_numbers)} tasks: {task_numbers[:10]}{'...' if len(task_numbers) > 10 else ''}")
 
         # Prepare tasks to process
         tasks_to_process = []
@@ -1830,7 +1917,12 @@ class ProVTopAgent:
         # CHANGED: write benchmark_path to a file so TaskWorker.process_task can
         # look it up when running Step 6 simulation evaluation
         with open(os.path.join(output_base_dir, "benchmark_path.txt"), "w") as f:
-            f.write(os.path.abspath(benchmark_path))
+            normalized_benchmark_path = os.path.join(output_base_dir, "normalized_benchmark.json")
+            write_normalized_benchmark(
+                [benchmark_data[key] for key in sorted(benchmark_data)],
+                normalized_benchmark_path,
+            )
+            f.write(os.path.abspath(normalized_benchmark_path))
 
         # Create worker pool (limited by max_concurrency)
         num_workers = min(len(tasks_to_process), self.args.max_concurrency, os.cpu_count() or 4)
@@ -2013,6 +2105,9 @@ def main():
     parser.add_argument("--benchmark_path", type=str,
                         default="verilog-eval/HDLBits/test_benchmark_new.json",
                         help="Path to benchmark file")
+    parser.add_argument("--benchmark_format", type=str, default="auto",
+                        choices=["auto", "json", "hdlbits", "hdlbits_json", "rtllm", "rtllm_folder", "folder"],
+                        help="Benchmark adapter format")
     parser.add_argument("--max_concurrency", type=int, default=8,
                         help="Maximum number of concurrent Ray workers")
     parser.add_argument("--sampling_size", type=int, default=3,
