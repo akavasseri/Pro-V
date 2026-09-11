@@ -1,8 +1,9 @@
 """
-LLM Client Wrapper using LlamaIndex for vLLM
+LLM Client Wrapper using LlamaIndex for OpenAI-compatible providers
 
 This module provides a wrapper around LlamaIndex's OpenAI-compatible LLM
-to connect to vLLM endpoints with proper configuration.
+to connect to vLLM or hosted OpenAI-compatible endpoints with proper
+configuration.
 """
 
 import logging
@@ -34,11 +35,12 @@ class VLLMLLMClient:
         max_tokens: int = 20000,
         timeout: float = 120.0
     ):
-        """Initialize the VLL LLM Client
+        """Initialize the LLM client
 
         Args:
-            endpoints: List of vLLM endpoint URLs (e.g., ["http://127.0.0.1:8020"])
-            model_name: Model name served by vLLM
+            endpoints: List of endpoint URLs (e.g., ["http://127.0.0.1:8020"] or
+                ["https://api.openai.com"])
+            model_name: Model name served by the provider
             temperature: Sampling temperature (0.0 for greedy)
             top_p: Top-p sampling parameter
             max_tokens: Maximum tokens to generate
@@ -52,7 +54,14 @@ class VLLMLLMClient:
         self.timeout = timeout
         self.current_endpoint_idx = 0
 
+        provider = os.getenv("LLM_PROVIDER", "vllm").strip().lower()
+        api_key = os.getenv("OPENAI_API_KEY") if provider == "openai" else "dummy"
+        configured_base = os.getenv("OPENAI_BASE_URL", "").strip()
+        if provider == "openai" and not api_key:
+            raise ValueError("OPENAI_API_KEY must be set when LLM_PROVIDER=openai")
+
         logger.info(f"VLLMLLMClient initialized:")
+        logger.info(f"  - Provider: {provider}")
         logger.info(f"  - Endpoints: {endpoints}")
         logger.info(f"  - Model: {model_name}")
         logger.info(f"  - Temperature: {temperature}")
@@ -62,9 +71,13 @@ class VLLMLLMClient:
         # Create LlamaIndex LLM instances for each endpoint
         self.llms = []
         for endpoint in endpoints:
+            api_base = configured_base or endpoint
+            api_base = api_base.rstrip("/")
+            if provider != "openai" and not api_base.endswith("/v1"):
+                api_base = f"{api_base}/v1"
             llm = OpenAILike(
-                api_base=f"{endpoint}/v1",
-                api_key="dummy",  # vLLM doesn't require real key
+                api_base=api_base,
+                api_key=api_key,
                 model=model_name,
                 temperature=temperature,
                 top_p=top_p,
@@ -73,7 +86,7 @@ class VLLMLLMClient:
                 is_chat_model=True
             )
             self.llms.append(llm)
-            logger.info(f"  - Created LLM client for: {endpoint}")
+            logger.info(f"  - Created LLM client for: {api_base}")
 
     def _get_next_llm(self):
         """Get next LLM using round-robin load balancing"""
@@ -190,11 +203,15 @@ def create_llm_client_from_config(
     Returns:
         Configured VLLMLLMClient instance
     """
-    # Parse endpoints
-    endpoints = [ep.strip() for ep in endpoints_csv.split(',') if ep.strip()]
+    provider = os.getenv("LLM_PROVIDER", "vllm").strip().lower()
+    if provider == "openai":
+        endpoints = [os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")]
+        model_name = os.getenv("OPENAI_MODEL", model_name)
+    else:
+        endpoints = [ep.strip() for ep in endpoints_csv.split(',') if ep.strip()]
 
     if not endpoints:
-        raise ValueError("No vLLM endpoints provided")
+        raise ValueError("No LLM endpoints provided")
 
     # Get configuration from environment with fallbacks
     if temperature is None:
@@ -234,11 +251,15 @@ def create_pychecker_llm_client_from_config(
     Returns:
         Configured VLLMLLMClient instance for PyChecker
     """
-    # Parse endpoints
-    endpoints = [ep.strip() for ep in endpoints_csv.split(',') if ep.strip()]
+    provider = os.getenv("LLM_PROVIDER", "vllm").strip().lower()
+    if provider == "openai":
+        endpoints = [os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")]
+        model_name = os.getenv("OPENAI_MODEL", model_name)
+    else:
+        endpoints = [ep.strip() for ep in endpoints_csv.split(',') if ep.strip()]
 
     if not endpoints:
-        raise ValueError("No vLLM endpoints provided")
+        raise ValueError("No LLM endpoints provided")
 
     # Get configuration from environment with fallbacks
     if sample_temperature is None:

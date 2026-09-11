@@ -8,7 +8,9 @@ Architecture: Only __init__ and run methods.
 import json
 import logging
 import os
+import re
 import subprocess
+import sys
 from typing import Dict, Any, Optional
 
 try:
@@ -19,6 +21,10 @@ except ImportError:
     ray = None
 
 logger = logging.getLogger(__name__)
+
+
+def _python_executable() -> str:
+    return os.getenv("PRO_V_PYTHON") or sys.executable or "python3"
 
 CMB_SYSTEM_PROMPT = """
 You are an expert in RTL design. 
@@ -84,7 +90,7 @@ Each dictionary represents one test vector:
 
 1. **INPUT signals only**: Only include INPUT signals in your test vectors. DO NOT include output signals.
 2. **Binary strings only**: Use "0", "1", "101", etc. No 'X' or 'Z' values.
-3. **All inputs included**: Every test vector must include all INPUT signals from the module header (excluding clk).
+3. **All inputs included**: Every test vector must include all non-clock INPUT signals from the module header.
 4. **Variable names**: Must exactly match the INPUT signal names from module header.
 5. **Dictionary format**: Each test vector MUST be a dictionary with INPUT signal names as keys.
 6. **IMPORTANT**: DO NOT hard-code stimulus as JSON arrays directly. Use Python programming techniques to generate them dynamically.
@@ -157,29 +163,60 @@ CMB_INSTRUCTIONS = """
 Instructions for stimulus_gen():
 1. Return a list of dictionaries
 2. Each dictionary has INPUT signal names as keys, binary strings as values (NO output signals)
-3. Include all INPUT signals (except clk) from the module header
+3. Include all non-clock INPUT signals from the module header
 4. DO NOT include any output signals in the stimulus
 5. Generate comprehensive test cases covering corners, edges, and random cases
 """
 
 CMB_PYTHON_HEADER = """
 import json
+import os
 import random
 import numpy as np
 import re
+# Deterministic stimulus: seed the RNGs so a given stimulus_gen() is reproducible
+# run-to-run. Override with PROV_STIMULUS_SEED. (LLM sampling variance is separate.)
+_prov_seed = int(os.environ.get("PROV_STIMULUS_SEED", "1234"))
+random.seed(_prov_seed)
+try:
+    np.random.seed(_prov_seed)
+except Exception:
+    pass
 """
 
 CMB_TAIL = """
+def resolve_verilog_file(preferred="top_module.v"):
+    for candidate in [preferred, "top_module.v", "module_code.v", "header.v"]:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return preferred
+
+def is_clock_signal(name):
+    lower = (name or "").lower()
+    return lower in {"clk", "clock"} or lower.startswith("clk") or lower.endswith("_clk") or "clock" in lower
+
 def extract_module_ports(verilog_file="top_module.v"):
+    verilog_file = resolve_verilog_file(verilog_file)
     \"\"\"
     Extract module input port names from Verilog file.
-    Excludes ONLY 'clk' and 'clock' signals - reset signals ARE included!
+    Excludes clock-like signals - reset/data/control signals ARE included!
     Also extracts output ports for validation purposes.
     Returns dict with 'inputs' and 'outputs' sets.
     \"\"\"
     try:
         with open(verilog_file, 'r') as f:
             content = f.read()
+
+        try:
+            from pro_v.mutation_strength import parse_ports
+            ports = parse_ports(content)
+            if ports.inputs or ports.outputs:
+                return {
+                    "inputs": {name for name, _ in ports.inputs},
+                    "outputs": {name for name, _ in ports.outputs},
+                }
+        except Exception:
+            pass
 
         # Extract module declaration
         module_match = re.search(r'module\\s+\\w+\\s*\\((.*?)\\);', content, re.DOTALL)
@@ -189,12 +226,11 @@ def extract_module_ports(verilog_file="top_module.v"):
         port_list = module_match.group(1)
 
         # Extract input signals
-        # IMPORTANT: Only exclude 'clk' and 'clock' - keep ALL other inputs including reset signals!
+        # IMPORTANT: Only exclude clock-like ports - keep reset/data/control inputs.
         input_pattern = r'input\\s+(?:(?:wire|reg|logic)\\s+)?(?:\\[\\s*\\d+\\s*:\\s*\\d+\\s*\\])?\\s*(\\w+)'
         inputs = set()
         for match in re.findall(input_pattern, port_list):
-            # Only exclude clock signals - reset signals should be included in stimulus
-            if match.lower() not in ['clk', 'clock']:
+            if not is_clock_signal(match):
                 inputs.add(match)
 
         # Extract output signals (for filtering purposes only - NOT for stimulus generation)
@@ -294,7 +330,7 @@ if __name__ == "__main__":
     import sys
     result = stimulus_gen()
     print("\\n=== Fixing and verifying stimulus ===")
-    fixed_result, warnings = fix_stimulus(result, verilog_file="top_module.v")
+    fixed_result, warnings = fix_stimulus(result, verilog_file=resolve_verilog_file())
     if warnings:
         print("⚠ Warnings:")
         for w in warnings: print(f"  - {w}")
@@ -333,8 +369,8 @@ Your task is to generate a Python function named "stimulus_gen" that produces te
    - ❌ WRONG: If module has "reset", do NOT use "rst" or "areset"
    - ❌ WRONG: Do NOT invent signal names like "load", "data_in" if they don't exist in module_header
 
-**2. Input Signals Only (excluding clk)**:
-   - ONLY include INPUT signals from module_header (NOT outputs, NOT clk)
+**2. Input Signals Only (excluding clock-like ports)**:
+   - ONLY include non-clock INPUT signals from module_header (NOT outputs, NOT clocks)
    - If module has "input clk, input reset, output q", ONLY use "reset" in stimulus
    - Do NOT include "clk" or "q" in your stimulus
 
@@ -380,18 +416,18 @@ module top_module (
     output Y3
 );
 ```
-Your stimulus_gen() should ONLY generate test scenarios for the **input signals** (excluding clk): `y`, `w`
+Your stimulus_gen() should ONLY generate test scenarios for the **non-clock input signals**: `y`, `w`
 Do NOT include `clk` or output signals `Y1`, `Y3` in your test scenarios.
 
 
 ## Requirements
 
-1. **INPUT signals only (excluding clk)**: Only include INPUT signals in your test scenarios. DO NOT include clk or output signals.
+1. **INPUT signals only (excluding clock-like ports)**: Only include non-clock INPUT signals in your test scenarios. DO NOT include clock or output signals.
 2. **Clock cycles**: Each scenario must have a "clock_cycles" field (integer)
 3. **Signal sequences**: Each INPUT signal is a list of binary strings with length = clock_cycles
 4. **Binary strings only**: Use "0", "1", etc. No 'X' or 'Z' values.
-5. **CRITICAL - Signal Names**: You MUST use EXACTLY the same INPUT signal names as in the module_header above (excluding clk). DO NOT use generic names like "reset", "enable", etc. if the actual signal names are different (e.g., "areset", "en").
-6. **All inputs included**: Include all INPUT signals from module header (except clk). DO NOT include output signals.
+5. **CRITICAL - Signal Names**: You MUST use EXACTLY the same non-clock INPUT signal names as in the module_header above. DO NOT use generic names like "reset", "enable", etc. if the actual signal names are different (e.g., "areset", "en").
+6. **All inputs included**: Include all non-clock INPUT signals from module header. DO NOT include output or clock-like signals.
 7. **CRITICAL - Sufficient Test Coverage**: Generate AT LEAST 50-100 test scenarios total:
    - Reset sequences: 5-10 scenarios
    - Normal operation patterns: 10-20 scenarios
@@ -422,7 +458,7 @@ For a shift register with this header:
 module shift_reg(input clk, input rst, input [7:0] data_in, input load, output [7:0] data_out);
 ```
 
-**IMPORTANT**: Your stimulus should ONLY include the input signals (excluding clk): `rst`, `data_in`, `load`
+**IMPORTANT**: Your stimulus should ONLY include the non-clock input signals: `rst`, `data_in`, `load`
 Do NOT include `clk` or the output signal `data_out` in your stimulus.
 
 ```python
@@ -599,8 +635,8 @@ Instructions for stimulus_gen():
 1. Return a **FLAT list** of dictionaries (scenarios) - DO NOT create nested lists!
 2. Each scenario must have "clock_cycles" (integer) and INPUT signal lists
 3. All INPUT signal lists must have length equal to clock_cycles
-4. Include all INPUT signals (except clk) from the module header
-5. DO NOT include clk or output signals in the stimulus
+4. Include all non-clock INPUT signals from the module header
+5. DO NOT include clock-like or output signals in the stimulus
 6. **CRITICAL - Generate AT LEAST 50-100 test scenarios total**:
    - Reset sequences: 5-10 scenarios
    - Normal operation: 10-20 scenarios
@@ -613,21 +649,51 @@ Instructions for stimulus_gen():
 SEQ_PYTHON_HEADER = """
 import re
 import json
+import os
 import random
 import numpy as np
+# Deterministic stimulus: seed the RNGs (override with PROV_STIMULUS_SEED).
+_prov_seed = int(os.environ.get("PROV_STIMULUS_SEED", "1234"))
+random.seed(_prov_seed)
+try:
+    np.random.seed(_prov_seed)
+except Exception:
+    pass
 """
 
 SEQ_TAIL = """
+def resolve_verilog_file(preferred="top_module.v"):
+    for candidate in [preferred, "top_module.v", "module_code.v", "header.v"]:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return preferred
+
+def is_clock_signal(name):
+    lower = (name or "").lower()
+    return lower in {"clk", "clock"} or lower.startswith("clk") or lower.endswith("_clk") or "clock" in lower
+
 def extract_module_ports(verilog_file="top_module.v"):
+    verilog_file = resolve_verilog_file(verilog_file)
     \"\"\"
     Extract module input port names from Verilog file.
-    Excludes ONLY 'clk' and 'clock' signals - reset signals ARE included!
+    Excludes clock-like signals - reset/data/control signals ARE included!
     Also extracts output ports for validation purposes.
     Returns dict with 'inputs' and 'outputs' sets.
     \"\"\"
     try:
         with open(verilog_file, 'r') as f:
             content = f.read()
+
+        try:
+            from pro_v.mutation_strength import parse_ports
+            ports = parse_ports(content)
+            if ports.inputs or ports.outputs:
+                return {
+                    "inputs": {name for name, _ in ports.inputs},
+                    "outputs": {name for name, _ in ports.outputs},
+                }
+        except Exception:
+            pass
 
         # Extract module declaration
         module_match = re.search(r'module\\s+\\w+\\s*\\((.*?)\\);', content, re.DOTALL)
@@ -637,12 +703,11 @@ def extract_module_ports(verilog_file="top_module.v"):
         port_list = module_match.group(1)
 
         # Extract input signals
-        # IMPORTANT: Only exclude 'clk' and 'clock' - keep ALL other inputs including reset signals!
+        # IMPORTANT: Only exclude clock-like ports - keep reset/data/control inputs.
         input_pattern = r'input\\s+(?:(?:wire|reg|logic)\\s+)?(?:\\[\\s*\\d+\\s*:\\s*\\d+\\s*\\])?\\s*(\\w+)'
         inputs = set()
         for match in re.findall(input_pattern, port_list):
-            # Only exclude clock signals - reset signals should be included in stimulus
-            if match.lower() not in ['clk', 'clock']:
+            if not is_clock_signal(match):
                 inputs.add(match)
 
         # Extract output signals (for filtering purposes only - NOT for stimulus generation)
@@ -700,7 +765,7 @@ def fuzzy_match_signal(test_name, actual_signals):
 
 def fix_stimulus_seq(stimulus_data, verilog_file="top_module.v"):
     \"\"\"
-    Fix sequential stimulus by ensuring it only contains INPUT signals (excluding clk).
+    Fix sequential stimulus by ensuring it only contains non-clock INPUT signals.
     - Flattens nested lists in stimulus data
     - Filters out any OUTPUT signals (they should NOT be in stimulus)
     - Fuzzy matches signal names to actual input signals
@@ -723,7 +788,7 @@ def fix_stimulus_seq(stimulus_data, verilog_file="top_module.v"):
     stimulus_data = flattened_data
 
     ports = extract_module_ports(verilog_file)
-    expected_inputs = ports["inputs"]  # Only INPUT signals (excluding clk) should be in stimulus
+    expected_inputs = ports["inputs"]  # Only non-clock INPUT signals should be in stimulus
     expected_outputs = ports["outputs"]  # OUTPUT signals used for filtering only
     if not expected_inputs:
         return stimulus_data, ["Could not extract input ports"]
@@ -758,7 +823,7 @@ def fix_stimulus_seq(stimulus_data, verilog_file="top_module.v"):
             if test_signal in expected_outputs or fuzzy_match_signal(test_signal, expected_outputs):
                 warnings.append(f"Scenario {idx}: Signal '{test_signal}' is an OUTPUT, filtering out (stimulus should only have inputs)")
                 continue
-            # Try to match to input signals (stimulus should only contain inputs, excluding clk)
+            # Try to match to input signals (stimulus should only contain non-clock inputs)
             matched = fuzzy_match_signal(test_signal, expected_inputs)
             if matched:
                 if isinstance(values, list):
@@ -804,7 +869,7 @@ if __name__ == "__main__":
     import sys
     result = stimulus_gen()
     print("\\n=== Fixing and verifying stimulus ===")
-    fixed_result, warnings = fix_stimulus_seq(result, verilog_file="top_module.v")
+    fixed_result, warnings = fix_stimulus_seq(result, verilog_file=resolve_verilog_file())
     if warnings:
         print("⚠ Warnings:")
         for w in warnings: print(f"  - {w}")
@@ -837,7 +902,7 @@ class GenTBAgent:
     def _generate_stimulus_prompt(self, problem_input: str, spec: str, circuit_type: str) -> str:
         """Generate prompt for stimulus generation"""
 
-        if circuit_type == "CMB":
+        if str(circuit_type).lower() == "cmb":
             prompt = CMB_SYSTEM_PROMPT + "\n\n" + CMB_GENERATION_PROMPT.format(
                 description=problem_input,
                 module_header=spec
@@ -874,7 +939,21 @@ class GenTBAgent:
                 user_prompt = self._generate_stimulus_prompt(description, header, circuit_type)
 
                 # For retry attempts, append previous code and error information
-                if attempt > 0 and previous_code and previous_error:
+                if attempt > 0 and previous_error in (
+                    "Empty LLM response", "No Python code extracted from LLM response"
+                ):
+                    # The model returned nothing -- usually a reasoning/<think> stall that
+                    # exhausted the token budget before emitting code. At temperature 0 a
+                    # plain retry reproduces the same empty output, so perturb the prompt
+                    # AND force code-only output to break the stall.
+                    user_prompt += (
+                        f"\n\n---\n\n**RETRY ATTEMPT {attempt + 1}**\n\n"
+                        "Your previous response was empty. Do NOT include any reasoning, "
+                        "explanation, or <think> content. Respond with ONLY a single "
+                        "```python code block and nothing else. Begin your reply "
+                        "immediately with ```python."
+                    )
+                elif attempt > 0 and previous_code and previous_error:
                     user_prompt += f"\n\n---\n\n**RETRY ATTEMPT {attempt + 1}**\n\n"
                     user_prompt += "The previous code generated has errors. Please fix the issues.\n\n"
                     user_prompt += f"<previous_code>\n```python\n{previous_code}\n```\n</previous_code>\n\n"
@@ -891,7 +970,9 @@ class GenTBAgent:
                     continue
 
                 # Extract Python code
-                python_code = (CMB_PYTHON_HEADER if circuit_type == "CMB" else SEQ_PYTHON_HEADER) + "\n\n" + self._extract_code(response)+"\n\n"+(CMB_TAIL if circuit_type == "CMB" else SEQ_TAIL)
+                is_cmb = str(circuit_type).lower() == "cmb"
+                generated_body = self._extract_code(response)
+                python_code = (CMB_PYTHON_HEADER if is_cmb else SEQ_PYTHON_HEADER) + "\n\n" + generated_body+"\n\n"+(CMB_TAIL if is_cmb else SEQ_TAIL)
 
                 if not python_code:
                     logger.warning(f"Attempt {attempt + 1} failed: No Python code extracted")
@@ -905,10 +986,21 @@ class GenTBAgent:
                 logger.info(f"Validating Python syntax for attempt {attempt + 1}")
                 syntax_error = self._validate_python_syntax(python_code)
                 if syntax_error:
-                    error_msg = f"Python syntax error:\n{syntax_error}"
-                    logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
-                    previous_error = error_msg
-                    continue
+                    fallback_body = self._build_fallback_stimulus_code(description, header, circuit_type)
+                    fallback_code = (CMB_PYTHON_HEADER if is_cmb else SEQ_PYTHON_HEADER) + "\n\n" + fallback_body + "\n\n" + (CMB_TAIL if is_cmb else SEQ_TAIL)
+                    fallback_error = self._validate_python_syntax(fallback_code)
+                    if fallback_error is None:
+                        logger.warning(
+                            f"Attempt {attempt + 1}: LLM code had syntax error; "
+                            "using header-derived fallback stimulus instead"
+                        )
+                        python_code = fallback_code
+                        previous_code = python_code
+                    else:
+                        error_msg = f"Python syntax error:\n{syntax_error}"
+                        logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
+                        previous_error = error_msg
+                        continue
 
                 # Save Python code
                 os.makedirs(output_dir, exist_ok=True)
@@ -948,7 +1040,7 @@ class GenTBAgent:
                 else:
                     # Fallback to subprocess if no worker provided
                     result = subprocess.run(
-                        ["python", "stimulus_gen.py"],
+                        [_python_executable(), "stimulus_gen.py"],
                         cwd=output_dir,
                         capture_output=True,
                         text=True,
@@ -1000,6 +1092,11 @@ class GenTBAgent:
                 # Validate JSON format
                 with open(stimulus_json_path, 'r') as f:
                     stimulus_data = json.load(f)
+                if not isinstance(stimulus_data, list):
+                    error_msg = "stimulus.json is not a list"
+                    logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
+                    previous_error = error_msg
+                    continue
 
                 logger.info(f"GenTBAgent.run succeeded on attempt {attempt + 1}")
                 return {
@@ -1027,6 +1124,50 @@ class GenTBAgent:
         logger.error(f"GenTBAgent.run failed after {self.max_retries} attempts")
         if previous_error:
             logger.error(f"Last error: {previous_error}")
+        try:
+            is_cmb = str(circuit_type).lower() == "cmb"
+            fallback_body = self._build_fallback_stimulus_code(description, header, circuit_type)
+            fallback_code = (
+                (CMB_PYTHON_HEADER if is_cmb else SEQ_PYTHON_HEADER)
+                + "\n\n"
+                + fallback_body
+                + "\n\n"
+                + (CMB_TAIL if is_cmb else SEQ_TAIL)
+            )
+            fallback_error = self._validate_python_syntax(fallback_code)
+            if fallback_error is None:
+                os.makedirs(output_dir, exist_ok=True)
+                stimulus_py_path = os.path.join(output_dir, "stimulus_gen.py")
+                with open(stimulus_py_path, "w") as f:
+                    f.write(fallback_code)
+                result = subprocess.run(
+                    [_python_executable(), "stimulus_gen.py"],
+                    cwd=output_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                stimulus_json_path = os.path.join(output_dir, "stimulus.json")
+                if result.returncode == 0 and os.path.exists(stimulus_json_path):
+                    logger.warning(
+                        "GenTB LLM attempts failed; using header-derived fallback stimulus"
+                    )
+                    return {
+                        "success": True,
+                        "stimulus_json_path": stimulus_json_path,
+                        "python_code": fallback_code,
+                        "attempt": "fallback_after_retries",
+                    }
+                logger.error(
+                    "Fallback stimulus execution failed: returncode=%s stdout=%s stderr=%s",
+                    result.returncode,
+                    result.stdout[-1000:],
+                    result.stderr[-1000:],
+                )
+            else:
+                logger.error(f"Fallback stimulus syntax error: {fallback_error}")
+        except Exception as fallback_exc:
+            logger.error(f"Fallback stimulus failed: {fallback_exc}", exc_info=True)
         return {
             "success": False,
             "error": f"Failed after {self.max_retries} attempts. Last error: {previous_error if previous_error else 'Unknown error'}",
@@ -1078,24 +1219,144 @@ if __name__ == "__main__":
             Extracted Python code
         """
         import re
-        
+
+        cleaned_response = response or ""
+        cleaned_response = re.sub(r'<think>.*?</think>', '', cleaned_response, flags=re.DOTALL)
+        cleaned_response = re.sub(r'</?think>', '', cleaned_response)
+
         # Try to find code in ```python``` blocks
         pattern = r'```python\s*(.*?)\s*```'
-        matches = re.findall(pattern, response, re.DOTALL)
+        matches = re.findall(pattern, cleaned_response, re.DOTALL)
         
         if matches:
             return matches[0].strip()
         
         # Try to find code in ``` blocks
         pattern = r'```\s*(.*?)\s*```'
-        matches = re.findall(pattern, response, re.DOTALL)
+        matches = re.findall(pattern, cleaned_response, re.DOTALL)
         
         if matches:
             return matches[0].strip()
+
+        # Thinking-mode models sometimes emit prose before/after the actual
+        # function. Keep only the candidate implementation when possible.
+        def_idx = cleaned_response.find("def stimulus_gen")
+        if def_idx >= 0:
+            return cleaned_response[def_idx:].strip()
+        def_idx = cleaned_response.find("def ")
+        if def_idx >= 0:
+            return cleaned_response[def_idx:].strip()
         
         # Use entire response if no code blocks found
         logger.warning("No code blocks found in response, using entire response")
-        return response.strip()
+        return cleaned_response.strip()
+
+    def _parse_header_inputs(self, header: str) -> Dict[str, int]:
+        """Best-effort public-header input parser for fallback stimulus."""
+        try:
+            from pro_v.mutation_strength import parse_ports
+            parsed = parse_ports(header or "")
+            if parsed.inputs:
+                return {name: int(width) for name, width in parsed.inputs}
+        except Exception:
+            pass
+        text = re.sub(r'//.*', '', header or '')
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        text = re.sub(r',\s*(input|output)\b', r'; \1', text)
+        inputs: Dict[str, int] = {}
+        pattern = re.compile(
+            r'\binput\b\s+(?:(?:wire|reg|logic|signed|unsigned)\s+)*'
+            r'(?:\[\s*(\d+)\s*:\s*(\d+)\s*\]\s*)?'
+            r'([^;\n\)]+)'
+        )
+        for msb, lsb, names_blob in pattern.findall(text):
+            width = abs(int(msb) - int(lsb)) + 1 if msb and lsb else 1
+            for raw_name in names_blob.split(','):
+                match = re.search(r'([A-Za-z_][A-Za-z0-9_$]*)', raw_name)
+                if not match:
+                    continue
+                name = match.group(1)
+                if self._is_clock_like_name(name):
+                    continue
+                if name.lower() in {'wire', 'reg', 'logic', 'signed', 'unsigned'}:
+                    continue
+                inputs[name] = width
+        return inputs
+
+    def _is_clock_like_name(self, name: str) -> bool:
+        lower = (name or "").lower()
+        return lower in {"clk", "clock"} or lower.startswith("clk") or lower.endswith("_clk") or "clock" in lower
+
+    def _build_fallback_stimulus_code(self, description: str, header: str, circuit_type: str) -> str:
+        """Generate deploy-safe fallback stimulus using only the public header/spec."""
+        inputs = self._parse_header_inputs(header)
+        is_cmb = str(circuit_type).lower() == "cmb"
+        payload = json.dumps(inputs, sort_keys=True)
+        if is_cmb:
+            return f'''def stimulus_gen():
+    inputs = {payload}
+    names = list(inputs.keys())
+    total_bits = sum(int(w) for w in inputs.values())
+    vectors = []
+    def row_from_int(value):
+        row = {{}}
+        shift = total_bits
+        for name in names:
+            width = int(inputs[name])
+            shift -= width
+            row[name] = format((value >> shift) & ((1 << width) - 1), "0%db" % width)
+        return row
+    limit = 1 << total_bits if total_bits <= 10 else min(4096, max(512, 1 << min(total_bits, 12)))
+    if total_bits <= 10:
+        for value in range(1 << total_bits):
+            vectors.append(row_from_int(value))
+    else:
+        seeds = [0, (1 << total_bits) - 1]
+        for bit in range(min(total_bits, 64)):
+            seeds.append(1 << bit)
+            seeds.append(((1 << total_bits) - 1) ^ (1 << bit))
+        for value in seeds:
+            vectors.append(row_from_int(value & ((1 << total_bits) - 1)))
+        rng = random.Random(_prov_seed)
+        while len(vectors) < limit:
+            vectors.append(row_from_int(rng.getrandbits(total_bits)))
+    return vectors
+'''
+        return f'''def stimulus_gen():
+    inputs = {payload}
+    names = list(inputs.keys())
+    reset_names = [n for n in names if "reset" in n.lower() or n.lower() in ("rst", "rst_n", "areset", "arst")]
+    data_names = [n for n in names if n not in reset_names]
+    scenarios = []
+    def bits(value, width):
+        return format(value & ((1 << int(width)) - 1), "0%db" % int(width))
+    def make_scenario(cycles, mode):
+        row = {{"clock_cycles": cycles}}
+        for name in reset_names:
+            active_low = name.lower().endswith("n") or name.lower().endswith("_n")
+            asserted = "0" if active_low else "1"
+            deasserted = "1" if active_low else "0"
+            row[name] = [asserted] + [deasserted] * (cycles - 1)
+        rng = random.Random(_prov_seed + cycles + len(mode))
+        for name in data_names:
+            width = int(inputs[name])
+            if mode == "zeros":
+                seq = [bits(0, width) for _ in range(cycles)]
+            elif mode == "ones":
+                seq = [bits((1 << width) - 1, width) for _ in range(cycles)]
+            elif mode == "alternate":
+                seq = [bits((i & 1) * ((1 << width) - 1), width) for i in range(cycles)]
+            elif mode == "walk":
+                seq = [bits(1 << (i % max(1, min(width, 32))), width) for i in range(cycles)]
+            else:
+                seq = [bits(rng.getrandbits(width), width) for _ in range(cycles)]
+            row[name] = seq
+        return row
+    for cycles in (5, 8, 16, 32):
+        for mode in ("zeros", "ones", "alternate", "walk", "random"):
+            scenarios.append(make_scenario(cycles, mode))
+    return scenarios
+'''
     
     def _validate_python_syntax(self, code: str) -> Optional[str]:
         """Validate Python code syntax

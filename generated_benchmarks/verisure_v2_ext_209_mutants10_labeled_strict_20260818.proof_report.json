@@ -1,0 +1,227 @@
+{
+  "source_benchmark": "generated_benchmarks/verisure_v2_ext_209_mutants10_labeled_auditclean_20260818.json",
+  "source_audit": "generated_benchmarks/verisure_v2_ext_209_mutants10_labeled_auditclean_20260818.audit3.json",
+  "totals": {
+    "tasks": 209,
+    "mutants": 1474,
+    "tasks_with_mutants": 195,
+    "tasks_full_10": 104,
+    "non_equiv": 1429,
+    "equiv": 45
+  },
+  "dropped_after_clean_audit": [
+    {
+      "task_number": 137,
+      "task_id": "Prob137_fsm_serial",
+      "mutant_idx": 1,
+      "circuit_type": "SEQ",
+      "stored_label_non_equivalent": true,
+      "passes": {
+        "baseline": {
+          "label_non_equivalent": null,
+          "matches_stored_label": null,
+          "equivalent": false,
+          "certain": false,
+          "unknown": true,
+          "error": "no divergence found in bounded sequential search",
+          "witness_count": 0
+        },
+        "repeat": {
+          "label_non_equivalent": null,
+          "matches_stored_label": null,
+          "equivalent": false,
+          "certain": false,
+          "unknown": true,
+          "error": "no divergence found in bounded sequential search",
+          "witness_count": 0
+        },
+        "strong": {
+          "label_non_equivalent": true,
+          "matches_stored_label": true,
+          "equivalent": false,
+          "certain": false,
+          "unknown": false,
+          "error": "",
+          "witness_count": 1
+        }
+      },
+      "all_three_passes_match": false
+    },
+    {
+      "task_number": 146,
+      "task_id": "Prob146_fsm_serialdata",
+      "mutant_idx": 1,
+      "circuit_type": "SEQ",
+      "stored_label_non_equivalent": true,
+      "passes": {
+        "baseline": {
+          "label_non_equivalent": null,
+          "matches_stored_label": null,
+          "equivalent": false,
+          "certain": false,
+          "unknown": true,
+          "error": "no divergence found in bounded sequential search",
+          "witness_count": 0
+        },
+        "repeat": {
+          "label_non_equivalent": null,
+          "matches_stored_label": null,
+          "equivalent": false,
+          "certain": false,
+          "unknown": true,
+          "error": "no divergence found in bounded sequential search",
+          "witness_count": 0
+        },
+        "strong": {
+          "label_non_equivalent": true,
+          "matches_stored_label": true,
+          "equivalent": false,
+          "certain": false,
+          "unknown": false,
+          "error": "",
+          "witness_count": 1
+        }
+      },
+      "all_three_passes_match": false
+    },
+    {
+      "task_number": 156,
+      "task_id": "Prob156_review2015_fancytimer",
+      "mutant_idx": 4,
+      "circuit_type": "SEQ",
+      "stored_label_non_equivalent": true,
+      "passes": {
+        "baseline": {
+          "label_non_equivalent": null,
+          "matches_stored_label": null,
+          "equivalent": false,
+          "certain": false,
+          "unknown": true,
+          "error": "no divergence found in bounded sequential search",
+          "witness_count": 0
+        },
+        "repeat": {
+          "label_non_equivalent": true,
+          "matches_stored_label": true,
+          "equivalent": false,
+          "certain": false,
+          "unknown": false,
+          "error": "",
+          "witness_count": 1
+        },
+        "strong": {
+          "label_non_equivalent": true,
+          "matches_stored_label": true,
+          "equivalent": false,
+          "certain": false,
+          "unknown": false,
+          "error": "",
+          "witness_count": 1
+        }
+      },
+      "all_three_passes_match": false
+    },
+    {
+      "task_number": 174,
+      "task_id": "Prob174_apb_slave",
+      "mutant_idx": 2,
+      "circuit_type": "SEQ",
+      "stored_label_non_equivalent": true,
+      "passes": {
+        "baseline": {
+          "label_non_equivalent": true,
+          "matches_stored_label": true,
+          "equivalent": false,
+          "certain": false,
+          "unknown": false,
+          "error": "",
+          "witness_count": 1
+        },
+        "repeat": {
+          "label_non_equivalent": null,
+          "matches_stored_label": null,
+          "equivalent": false,
+          "certain": false,
+          "unknown": true,
+          "error": "no divergence found in bounded sequential search",
+          "witness_count": 0
+        },
+        "strong": {
+          "label_non_equivalent": true,
+          "matches_stored_label": true,
+          "equivalent": false,
+          "certain": false,
+          "unknown": false,
+          "error": "",
+          "witness_count": 1
+        }
+      },
+      "all_three_passes_match": false
+    },
+    {
+      "task_number": 174,
+      "task_id": "Prob174_apb_slave",
+      "mutant_idx": 3,
+      "circuit_type": "SEQ",
+      "stored_label_non_equivalent": true,
+      "passes": {
+        "baseline": {
+          "label_non_equivalent": null,
+          "matches_stored_label": null,
+          "equivalent": false,
+          "certain": false,
+          "unknown": true,
+          "error": "no divergence found in bounded sequential search",
+          "witness_count": 0
+        },
+        "repeat": {
+          "label_non_equivalent": true,
+          "matches_stored_label": true,
+          "equivalent": false,
+          "certain": false,
+          "unknown": false,
+          "error": "",
+          "witness_count": 1
+        },
+        "strong": {
+          "label_non_equivalent": true,
+          "matches_stored_label": true,
+          "equivalent": false,
+          "certain": false,
+          "unknown": false,
+          "error": "",
+          "witness_count": 1
+        }
+      },
+      "all_three_passes_match": false
+    }
+  ],
+  "dropped_all": [
+    {
+      "task_number": 137,
+      "task_id": "Prob137_fsm_serial",
+      "old_mutant_idx": 1
+    },
+    {
+      "task_number": 146,
+      "task_id": "Prob146_fsm_serialdata",
+      "old_mutant_idx": 1
+    },
+    {
+      "task_number": 156,
+      "task_id": "Prob156_review2015_fancytimer",
+      "old_mutant_idx": 4
+    },
+    {
+      "task_number": 174,
+      "task_id": "Prob174_apb_slave",
+      "old_mutant_idx": 2
+    },
+    {
+      "task_number": 174,
+      "task_id": "Prob174_apb_slave",
+      "old_mutant_idx": 3
+    }
+  ],
+  "proof_csv": "generated_benchmarks/verisure_v2_ext_209_mutants10_labeled_strict_20260818.proof.csv"
+}

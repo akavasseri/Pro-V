@@ -1,0 +1,167 @@
+[
+  {
+    "task": 2,
+    "id": "m2014_q6b",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "N",
+    "eval2_det": "n/a",
+    "eval2_agr": "n/a",
+    "fca_strength": "10/10",
+    "note": "model FRM wrong (correct RTL fails its testbench)"
+  },
+  {
+    "task": 5,
+    "id": "zero",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "Y",
+    "eval2_det": "0/5",
+    "eval2_agr": "5/5",
+    "fca_strength": "-",
+    "note": ""
+  },
+  {
+    "task": 8,
+    "id": "fsm3",
+    "type": "seq",
+    "eval0": "-",
+    "eval1": "-",
+    "eval2_det": "-",
+    "eval2_agr": "-",
+    "fca_strength": "n/s",
+    "note": "gen failed"
+  },
+  {
+    "task": 9,
+    "id": "vector2",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "N",
+    "eval2_det": "n/a",
+    "eval2_agr": "n/a",
+    "fca_strength": "5/5",
+    "note": "model FRM wrong (correct RTL fails its testbench)"
+  },
+  {
+    "task": 22,
+    "id": "m2014_q6c",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "N",
+    "eval2_det": "n/a",
+    "eval2_agr": "n/a",
+    "fca_strength": "10/10",
+    "note": "model FRM wrong (correct RTL fails its testbench)"
+  },
+  {
+    "task": 24,
+    "id": "2014_q4a",
+    "type": "seq",
+    "eval0": "Y",
+    "eval1": "N",
+    "eval2_det": "n/a",
+    "eval2_agr": "n/a",
+    "fca_strength": "n/s",
+    "note": "model FRM wrong (correct RTL fails its testbench)"
+  },
+  {
+    "task": 26,
+    "id": "circuit4",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "N",
+    "eval2_det": "n/a",
+    "eval2_agr": "n/a",
+    "fca_strength": "9/9",
+    "note": "model FRM wrong (correct RTL fails its testbench)"
+  },
+  {
+    "task": 30,
+    "id": "bugs_mux2",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "N",
+    "eval2_det": "n/a",
+    "eval2_agr": "n/a",
+    "fca_strength": "6/6",
+    "note": "model FRM wrong (correct RTL fails its testbench)"
+  },
+  {
+    "task": 61,
+    "id": "notgate",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "Y",
+    "eval2_det": "3/5",
+    "eval2_agr": "5/5",
+    "fca_strength": "3/3",
+    "note": ""
+  },
+  {
+    "task": 89,
+    "id": "count15",
+    "type": "seq",
+    "eval0": "Y",
+    "eval1": "N",
+    "eval2_det": "n/a",
+    "eval2_agr": "n/a",
+    "fca_strength": "n/s",
+    "note": "model FRM wrong (correct RTL fails its testbench)"
+  },
+  {
+    "task": 91,
+    "id": "kmap1",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "Y",
+    "eval2_det": "10/10",
+    "eval2_agr": "10/10",
+    "fca_strength": "10/10",
+    "note": ""
+  },
+  {
+    "task": 113,
+    "id": "vectorgates",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "Y",
+    "eval2_det": "10/10",
+    "eval2_agr": "10/10",
+    "fca_strength": "10/10",
+    "note": ""
+  },
+  {
+    "task": 119,
+    "id": "vector4",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "Y",
+    "eval2_det": "9/10",
+    "eval2_agr": "10/10",
+    "fca_strength": "9/9",
+    "note": ""
+  },
+  {
+    "task": 124,
+    "id": "step_one",
+    "type": "cmb",
+    "eval0": "Y",
+    "eval1": "Y",
+    "eval2_det": "3/10",
+    "eval2_agr": "10/10",
+    "fca_strength": "-",
+    "note": ""
+  },
+  {
+    "task": 150,
+    "id": "lemmings4",
+    "type": "seq",
+    "eval0": "Y",
+    "eval1": "N",
+    "eval2_det": "n/a",
+    "eval2_agr": "n/a",
+    "fca_strength": "n/s",
+    "note": "model FRM wrong (correct RTL fails its testbench)"
+  }
+]

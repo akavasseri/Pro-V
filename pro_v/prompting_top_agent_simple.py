@@ -328,7 +328,8 @@ def main():
     try:
         gpu_count_output = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            text=True
+            text=True,
+            timeout=15,
         )
         available_gpus = len(gpu_count_output.strip().split('\n'))
         print(f"\nDetected {available_gpus} GPUs")

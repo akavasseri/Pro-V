@@ -1,0 +1,290 @@
+{
+  "design_name": "top_module",
+  "design_type": "combinational",
+  "source_of_truth": "golden_dut.py",
+  "black_box_dut": "top_module.v",
+  "runtime_budget": {
+    "max_tests": 16,
+    "max_candidates": 5000,
+    "max_sequence_depth": 20,
+    "max_bfs_states": 256,
+    "max_runtime_seconds": 30.0
+  },
+  "interface": {
+    "inputs": {
+      "a": {
+        "width": 1,
+        "signed": false,
+        "control": true
+      },
+      "b": {
+        "width": 1,
+        "signed": false,
+        "control": true
+      }
+    },
+    "outputs": {
+      "y": {
+        "width": 1
+      }
+    },
+    "clock": null
+  },
+  "coverage_goals": [
+    {
+      "id": "goal_001",
+      "key": "bound[a]=max",
+      "type": "boundary",
+      "description": "Drive input boundary bound[a]=max"
+    },
+    {
+      "id": "goal_002",
+      "key": "bound[a]=one",
+      "type": "boundary",
+      "description": "Drive input boundary bound[a]=one"
+    },
+    {
+      "id": "goal_003",
+      "key": "bound[a]=zero",
+      "type": "boundary",
+      "description": "Drive input boundary bound[a]=zero"
+    },
+    {
+      "id": "goal_004",
+      "key": "bound[b]=max",
+      "type": "boundary",
+      "description": "Drive input boundary bound[b]=max"
+    },
+    {
+      "id": "goal_005",
+      "key": "bound[b]=one",
+      "type": "boundary",
+      "description": "Drive input boundary bound[b]=one"
+    },
+    {
+      "id": "goal_006",
+      "key": "bound[b]=zero",
+      "type": "boundary",
+      "description": "Drive input boundary bound[b]=zero"
+    },
+    {
+      "id": "goal_007",
+      "key": "ctrl[a]=0",
+      "type": "control_mode",
+      "description": "Exercise control setting ctrl[a]=0"
+    },
+    {
+      "id": "goal_008",
+      "key": "ctrl[a]=1",
+      "type": "control_mode",
+      "description": "Exercise control setting ctrl[a]=1"
+    },
+    {
+      "id": "goal_009",
+      "key": "ctrl[b]=0",
+      "type": "control_mode",
+      "description": "Exercise control setting ctrl[b]=0"
+    },
+    {
+      "id": "goal_010",
+      "key": "ctrl[b]=1",
+      "type": "control_mode",
+      "description": "Exercise control setting ctrl[b]=1"
+    },
+    {
+      "id": "goal_011",
+      "key": "distinguish[y<-a[0]]",
+      "type": "distinguishing",
+      "description": "Sensitize distinguish[y<-a[0]] (separates similar operations)"
+    },
+    {
+      "id": "goal_012",
+      "key": "distinguish[y<-b[0]]",
+      "type": "distinguishing",
+      "description": "Sensitize distinguish[y<-b[0]] (separates similar operations)"
+    },
+    {
+      "id": "goal_013",
+      "key": "eq[a==b]",
+      "type": "equality",
+      "description": "Equal-operand case eq[a==b] (separates < from <=, == from !=)"
+    },
+    {
+      "id": "goal_014",
+      "key": "out[y]=bool_false",
+      "type": "output_class",
+      "description": "Cover output class out[y]=bool_false"
+    },
+    {
+      "id": "goal_015",
+      "key": "out[y]=bool_true",
+      "type": "output_class",
+      "description": "Cover output class out[y]=bool_true"
+    },
+    {
+      "id": "goal_016",
+      "key": "out[y]=changed",
+      "type": "output_class",
+      "description": "Cover output class out[y]=changed"
+    },
+    {
+      "id": "goal_017",
+      "key": "out[y]=eq_input",
+      "type": "output_class",
+      "description": "Cover output class out[y]=eq_input"
+    },
+    {
+      "id": "goal_018",
+      "key": "out[y]=one",
+      "type": "output_class",
+      "description": "Cover output class out[y]=one"
+    },
+    {
+      "id": "goal_019",
+      "key": "out[y]=zero",
+      "type": "output_class",
+      "description": "Cover output class out[y]=zero"
+    }
+  ],
+  "tests": [
+    {
+      "name": "output_class_001_a1_b1",
+      "kind": "single_cycle",
+      "inputs": {
+        "a": 1,
+        "b": 1
+      },
+      "expected_outputs": {
+        "y": 1
+      },
+      "covers": [
+        "bound[a]=max",
+        "bound[a]=one",
+        "bound[b]=max",
+        "bound[b]=one",
+        "ctrl[a]=1",
+        "ctrl[b]=1",
+        "distinguish[y<-a[0]]",
+        "distinguish[y<-b[0]]",
+        "eq[a==b]",
+        "out[y]=bool_true",
+        "out[y]=eq_input",
+        "out[y]=one"
+      ],
+      "reason": "Selected because it produces meaningful output class(es) out[y]=bool_true, out[y]=changed, out[y]=eq_input, out[y]=one from the golden model."
+    },
+    {
+      "name": "output_class_002_a0_b0",
+      "kind": "single_cycle",
+      "inputs": {
+        "a": 0,
+        "b": 0
+      },
+      "expected_outputs": {
+        "y": 0
+      },
+      "covers": [
+        "bound[a]=zero",
+        "bound[b]=zero",
+        "ctrl[a]=0",
+        "ctrl[b]=0",
+        "eq[a==b]",
+        "out[y]=bool_false",
+        "out[y]=eq_input",
+        "out[y]=zero"
+      ],
+      "reason": "Selected because it produces meaningful output class(es) out[y]=bool_false, out[y]=eq_input, out[y]=zero from the golden model."
+    },
+    {
+      "name": "distinguish_001_a0_b1",
+      "kind": "single_cycle",
+      "inputs": {
+        "a": 0,
+        "b": 1
+      },
+      "expected_outputs": {
+        "y": 0
+      },
+      "covers": [
+        "bound[a]=zero",
+        "bound[b]=max",
+        "bound[b]=one",
+        "ctrl[a]=0",
+        "ctrl[b]=1",
+        "distinguish[y<-a[0]]",
+        "out[y]=bool_false",
+        "out[y]=eq_input",
+        "out[y]=zero"
+      ],
+      "reason": "Flipping bit 0 of 'a' flips output 'y' (0->1); this input pair distinguishes the reference's behavior from operations that would be insensitive here (e.g. AND vs OR need the mixed 01/10 case)."
+    },
+    {
+      "name": "distinguish_002_a1_b0",
+      "kind": "single_cycle",
+      "inputs": {
+        "a": 1,
+        "b": 0
+      },
+      "expected_outputs": {
+        "y": 0
+      },
+      "covers": [
+        "bound[a]=max",
+        "bound[a]=one",
+        "bound[b]=zero",
+        "ctrl[a]=1",
+        "ctrl[b]=0",
+        "distinguish[y<-b[0]]",
+        "out[y]=bool_false",
+        "out[y]=eq_input",
+        "out[y]=zero"
+      ],
+      "reason": "Flipping bit 0 of 'b' flips output 'y' (0->1); this input pair distinguishes the reference's behavior from operations that would be insensitive here (e.g. AND vs OR need the mixed 01/10 case)."
+    }
+  ],
+  "sequences": [],
+  "summary": {
+    "num_tests": 4,
+    "num_sequences": 0,
+    "num_goals": 19,
+    "covered_goals": [
+      "bound[a]=max",
+      "bound[a]=one",
+      "bound[a]=zero",
+      "bound[b]=max",
+      "bound[b]=one",
+      "bound[b]=zero",
+      "ctrl[a]=0",
+      "ctrl[a]=1",
+      "ctrl[b]=0",
+      "ctrl[b]=1",
+      "distinguish[y<-a[0]]",
+      "distinguish[y<-b[0]]",
+      "eq[a==b]",
+      "out[y]=bool_false",
+      "out[y]=bool_true",
+      "out[y]=eq_input",
+      "out[y]=one",
+      "out[y]=zero"
+    ],
+    "uncovered_goals": [
+      "out[y]=changed"
+    ],
+    "exhaustive": true,
+    "runtime_seconds": 0.0009
+  },
+  "frm_analysis": {
+    "inputs_read": [
+      "a",
+      "b"
+    ],
+    "outputs_written": [
+      "y"
+    ],
+    "operators": {
+      "&": 1
+    },
+    "num_branches": 0,
+    "num_loops": 0
+  }
+}

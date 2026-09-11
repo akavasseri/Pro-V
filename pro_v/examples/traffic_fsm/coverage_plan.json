@@ -1,0 +1,375 @@
+{
+  "design_name": "top_module",
+  "design_type": "sequential",
+  "source_of_truth": "golden_dut.py",
+  "black_box_dut": "top_module.v",
+  "runtime_budget": {
+    "max_tests": 40,
+    "max_candidates": 5000,
+    "max_sequence_depth": 10,
+    "max_bfs_states": 64,
+    "max_runtime_seconds": 30.0
+  },
+  "interface": {
+    "inputs": {
+      "rst": {
+        "width": 1,
+        "signed": false,
+        "control": true
+      },
+      "start": {
+        "width": 1,
+        "signed": false,
+        "control": true
+      },
+      "stall": {
+        "width": 1,
+        "signed": false,
+        "control": true
+      }
+    },
+    "outputs": {
+      "grant": {
+        "width": 1
+      },
+      "done": {
+        "width": 1
+      }
+    },
+    "clock": "clk"
+  },
+  "coverage_goals": [
+    {
+      "id": "goal_001",
+      "key": "reach_S1",
+      "type": "reach_state",
+      "description": "Reach state S1"
+    },
+    {
+      "id": "goal_002",
+      "key": "reach_S2",
+      "type": "reach_state",
+      "description": "Reach state S2"
+    },
+    {
+      "id": "goal_003",
+      "key": "reach_S3",
+      "type": "reach_state",
+      "description": "Reach state S3"
+    },
+    {
+      "id": "goal_004",
+      "key": "trans_S0->S0",
+      "type": "transition",
+      "description": "Exercise transition S0->S0"
+    },
+    {
+      "id": "goal_005",
+      "key": "trans_S0->S1",
+      "type": "transition",
+      "description": "Exercise transition S0->S1"
+    },
+    {
+      "id": "goal_006",
+      "key": "trans_S1->S0",
+      "type": "transition",
+      "description": "Exercise transition S1->S0"
+    },
+    {
+      "id": "goal_007",
+      "key": "trans_S1->S2",
+      "type": "transition",
+      "description": "Exercise transition S1->S2"
+    },
+    {
+      "id": "goal_008",
+      "key": "trans_S2->S0",
+      "type": "transition",
+      "description": "Exercise transition S2->S0"
+    },
+    {
+      "id": "goal_009",
+      "key": "trans_S2->S2",
+      "type": "transition",
+      "description": "Exercise transition S2->S2"
+    },
+    {
+      "id": "goal_010",
+      "key": "trans_S2->S3",
+      "type": "transition",
+      "description": "Exercise transition S2->S3"
+    },
+    {
+      "id": "goal_011",
+      "key": "trans_S3->S0",
+      "type": "transition",
+      "description": "Exercise transition S3->S0"
+    }
+  ],
+  "tests": [],
+  "sequences": [
+    {
+      "name": "transition_001_reach_S0",
+      "kind": "multi_cycle",
+      "steps": [
+        {
+          "cycle": 0,
+          "inputs": {
+            "rst": 0,
+            "start": 1,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 0
+          }
+        },
+        {
+          "cycle": 1,
+          "inputs": {
+            "rst": 0,
+            "start": 0,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 1,
+            "done": 0
+          }
+        },
+        {
+          "cycle": 2,
+          "inputs": {
+            "rst": 0,
+            "start": 0,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 1
+          }
+        },
+        {
+          "cycle": 3,
+          "inputs": {
+            "rst": 0,
+            "start": 0,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 0
+          }
+        }
+      ],
+      "target_state": "S0",
+      "covers": [
+        "reach_S1",
+        "reach_S2",
+        "reach_S3",
+        "trans_S0->S1",
+        "trans_S1->S2",
+        "trans_S2->S3",
+        "trans_S3->S0"
+      ],
+      "reason": "Reaches S3 then applies an input that transitions to S0, exercising that transition in the reference."
+    },
+    {
+      "name": "transition_002_reach_S0",
+      "kind": "multi_cycle",
+      "steps": [
+        {
+          "cycle": 0,
+          "inputs": {
+            "rst": 0,
+            "start": 0,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 0
+          }
+        }
+      ],
+      "target_state": "S0",
+      "covers": [
+        "trans_S0->S0"
+      ],
+      "reason": "Reaches S0 then applies an input that transitions to S0, exercising that transition in the reference."
+    },
+    {
+      "name": "transition_003_reach_S0",
+      "kind": "multi_cycle",
+      "steps": [
+        {
+          "cycle": 0,
+          "inputs": {
+            "rst": 0,
+            "start": 1,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 0
+          }
+        },
+        {
+          "cycle": 1,
+          "inputs": {
+            "rst": 1,
+            "start": 0,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 0
+          }
+        }
+      ],
+      "target_state": "S0",
+      "covers": [
+        "reach_S1",
+        "trans_S0->S1",
+        "trans_S1->S0"
+      ],
+      "reason": "Reaches S1 then applies an input that transitions to S0, exercising that transition in the reference."
+    },
+    {
+      "name": "transition_004_reach_S2",
+      "kind": "multi_cycle",
+      "steps": [
+        {
+          "cycle": 0,
+          "inputs": {
+            "rst": 0,
+            "start": 1,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 0
+          }
+        },
+        {
+          "cycle": 1,
+          "inputs": {
+            "rst": 0,
+            "start": 0,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 1,
+            "done": 0
+          }
+        },
+        {
+          "cycle": 2,
+          "inputs": {
+            "rst": 0,
+            "start": 0,
+            "stall": 1
+          },
+          "expected_outputs": {
+            "grant": 1,
+            "done": 0
+          }
+        }
+      ],
+      "target_state": "S2",
+      "covers": [
+        "reach_S1",
+        "reach_S2",
+        "trans_S0->S1",
+        "trans_S1->S2",
+        "trans_S2->S2"
+      ],
+      "reason": "Reaches S2 then applies an input that transitions to S2, exercising that transition in the reference."
+    },
+    {
+      "name": "transition_005_reach_S0",
+      "kind": "multi_cycle",
+      "steps": [
+        {
+          "cycle": 0,
+          "inputs": {
+            "rst": 0,
+            "start": 1,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 0
+          }
+        },
+        {
+          "cycle": 1,
+          "inputs": {
+            "rst": 0,
+            "start": 0,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 1,
+            "done": 0
+          }
+        },
+        {
+          "cycle": 2,
+          "inputs": {
+            "rst": 1,
+            "start": 0,
+            "stall": 0
+          },
+          "expected_outputs": {
+            "grant": 0,
+            "done": 0
+          }
+        }
+      ],
+      "target_state": "S0",
+      "covers": [
+        "reach_S1",
+        "reach_S2",
+        "trans_S0->S1",
+        "trans_S1->S2",
+        "trans_S2->S0"
+      ],
+      "reason": "Reaches S2 then applies an input that transitions to S0, exercising that transition in the reference."
+    }
+  ],
+  "summary": {
+    "num_tests": 0,
+    "num_sequences": 5,
+    "num_goals": 11,
+    "covered_goals": [
+      "reach_S1",
+      "reach_S2",
+      "reach_S3",
+      "trans_S0->S0",
+      "trans_S0->S1",
+      "trans_S1->S0",
+      "trans_S1->S2",
+      "trans_S2->S0",
+      "trans_S2->S2",
+      "trans_S2->S3",
+      "trans_S3->S0"
+    ],
+    "uncovered_goals": [],
+    "exhaustive": false,
+    "runtime_seconds": 0.0009,
+    "states_reached": 4
+  },
+  "state_labels": {
+    "S0": {
+      "state": 0
+    },
+    "S1": {
+      "state": 1
+    },
+    "S2": {
+      "state": 2
+    },
+    "S3": {
+      "state": 3
+    }
+  }
+}

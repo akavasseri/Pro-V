@@ -31,8 +31,18 @@ VERILATOR = $(VERILATOR_ROOT)/bin/verilator
 VERILATOR_COVERAGE = $(VERILATOR_ROOT)/bin/verilator_coverage
 endif
 
+# Coverage is OPT-IN and observational only. Export PRO_V_VERILATOR_COVERAGE=1
+# to collect real Verilator line+toggle coverage; when unset, the flags are
+# empty and behavior matches original Pro-V (no coverage, no coverage.dat).
+ifeq ($(PRO_V_VERILATOR_COVERAGE),1)
+COVERAGE_FLAGS = --coverage --coverage-line --coverage-toggle
+else
+COVERAGE_FLAGS =
+endif
+TIMING_FLAGS ?= --timing
+
 # Generate C++ in executable form
-VERILATOR_FLAGS = -cc --exe -x-assign fast -Wno-fatal --assert --coverage-line \
+VERILATOR_FLAGS = -cc --exe -x-assign fast -Wno-fatal --assert $(COVERAGE_FLAGS) $(TIMING_FLAGS) \
                  -Wno-WIDTHEXPAND -Wno-BLKSEQ -Wno-VARHIDDEN \
                  -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-CASEOVERLAP \
                  -Wno-BLKANDNBLK -Wno-COMBDLY -Wno-UNUSEDPARAM \
@@ -40,7 +50,7 @@ VERILATOR_FLAGS = -cc --exe -x-assign fast -Wno-fatal --assert --coverage-line \
                  -Wno-UNDRIVEN -Wno-UNUSEDGENVAR -Wno-PINMISSING \
                  -Wno-IMPLICIT -Wno-DECLFILENAME -Wno-UNSIGNED \
                  -Wno-CASEINCOMPLETE -Wno-UNOPTFLAT -Wno-MULTIDRIVEN \
-                 -CFLAGS -faligned-new -CFLAGS -Wno-sign-compare -CFLAGS -Wno-overflow
+                 -CFLAGS -O0 -CFLAGS -faligned-new -CFLAGS -Wno-sign-compare -CFLAGS -Wno-overflow
 
 # Input files for Verilator
 VERILATOR_INPUT = -f input.vc top_module.v sim-main.cpp rfuzz-harness.cpp
@@ -50,11 +60,15 @@ default: run
 
 run:
 	$(VERILATOR) $(VERILATOR_FLAGS) $(VERILATOR_INPUT)
-	cd obj_dir && make -f Vtop_module.mk
-	obj_dir/Vtop_module
+	cd obj_dir && make -f Vtop_module.mk OPT_FAST="-O0"
+	@obj_dir/Vtop_module; rc=$$?; \
+	if [ "$(PRO_V_VERILATOR_COVERAGE)" = "1" ] && ls coverage_s*.dat >/dev/null 2>&1; then \
+		$(VERILATOR_COVERAGE) --write-info coverage.dat coverage_s*.dat >/dev/null; \
+	fi; \
+	exit $$rc
 
 clean:
-	rm -rf obj_dir logs *.log *.dmp *.vpd coverage.dat core
+	rm -rf obj_dir logs *.log *.dmp *.vpd coverage.dat coverage_s*.dat core
 	rm -f *.o
 
 show-config:

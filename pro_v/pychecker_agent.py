@@ -252,7 +252,7 @@ class PyCheckerAgent:
             env_data.state.generated_python_code_list.append(generated_code)
 
         circuit_type = env_data.state.circuit_type
-        if circuit_type == "CMB":
+        if str(circuit_type).lower() == "cmb":
             python_header = PythonHeader
             tail = CMB_CHECKER_TAIL
         else:

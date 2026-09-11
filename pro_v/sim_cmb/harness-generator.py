@@ -36,6 +36,19 @@ def extract_module_signals(verilog_file):
 
     signals = {"inputs": {}, "outputs": {}}
 
+    try:
+        from pro_v.mutation_strength import parse_ports
+        ports = parse_ports(content)
+        if ports.inputs or ports.outputs:
+            signals = {
+                "inputs": {name: width for name, width in ports.inputs},
+                "outputs": {name: width for name, width in ports.outputs},
+            }
+            logger.info(f"Extracted signals via shared parser - inputs: {signals['inputs']}, outputs: {signals['outputs']}")
+            return signals
+    except Exception as e:
+        logger.warning(f"Shared port parser failed, falling back to local parser: {e}")
+
     # Extract module declaration
     module_match = re.search(r'module\s+\w+\s*\((.*?)\);', content, re.DOTALL)
     if not module_match:
@@ -54,8 +67,9 @@ def extract_module_signals(verilog_file):
     for match in input_matches:
         msb, lsb, name = match
 
-        # Skip clock and reset signals
-        if name.lower() in ['clk', 'clock', 'rst', 'reset', 'rstn', 'rst_n']:
+        # Skip clock-like signals only. Resets can be real combinational inputs.
+        lname = name.lower()
+        if lname in ['clk', 'clock'] or lname.startswith("clk") or lname.endswith("_clk") or "clock" in lname:
             continue
         if msb and lsb:
             width = int(msb) - int(lsb) + 1
@@ -104,6 +118,10 @@ def fuzzy_match_signal(test_name, actual_signals):
         if test_name.lower() == actual.lower():
             logger.info(f"Case-insensitive match: '{test_name}' -> '{actual}'")
             return actual
+
+    # Result runs should not silently reinterpret invented signal names.
+    # GenTB/PyChecker are responsible for producing real port names.
+    return None
 
     # Priority 3: Common name transformations
     # Try with/without underscores, common suffixes
@@ -192,6 +210,13 @@ def sanitize_value(value):
     
     # Remove any whitespace
     temp = temp.replace(" ", "")
+    if not temp:
+        raise ValueError("empty binary value")
+
+    # Preserve explicit don't-care/unknown expected values. The generated C++
+    # skips comparisons containing these bits, so they are valid testbench data.
+    if temp and all(c in 'xXzZ?' for c in temp):
+        return temp.lower().replace('?', 'x')
     
     # Check if it looks like a hex value (starts with 0x or 0X)
     if temp.lower().startswith("0x"):
@@ -273,6 +298,8 @@ def main():
         for data in datas:
             corrected_data = {"inputs": {}, "expected_outputs": {}}
 
+            invalid_input_signals = []
+
             # Process input signals (if any)
             for test_signal, value in data.get("inputs", {}).items():
                 if len(actual_signals["inputs"]) > 0:
@@ -289,27 +316,55 @@ def main():
                         matched_output = fuzzy_match_signal(test_signal, actual_signals["outputs"])
                         if matched_output:
                             logger.warning(f"Signal '{test_signal}' matched to output '{matched_output}', not using as input")
-                        # Check if it's a clock/reset signal that was filtered out
-                        elif test_signal.lower() in ['clk', 'clock', 'rst', 'reset', 'rstn', 'rst_n']:
-                            logger.info(f"Signal '{test_signal}' is a clock/reset signal (handled by simulation framework)")
+                        # Check if it's a clock-like signal that was filtered out
+                        elif (
+                            test_signal.lower() in ['clk', 'clock']
+                            or test_signal.lower().startswith("clk")
+                            or test_signal.lower().endswith("_clk")
+                            or "clock" in test_signal.lower()
+                        ):
+                            logger.info(f"Signal '{test_signal}' is a clock signal (handled by simulation framework)")
                         else:
                             logger.warning(f"Input signal '{test_signal}' not matched to any Verilog signal, skipping")
+                            invalid_input_signals.append(test_signal)
                 else:
                     logger.warning(f"No input signals in Verilog, skipping testbench input '{test_signal}'")
+                    invalid_input_signals.append(test_signal)
 
-            # If we have actual input signals not covered, add random values
+            if invalid_input_signals:
+                logger.warning(
+                    "Skipping test case with invalid input signal(s): %s",
+                    sorted(set(invalid_input_signals)),
+                )
+                continue
+
+            missing_inputs = [
+                actual_input
+                for actual_input in actual_signals["inputs"]
+                if actual_input not in corrected_data["inputs"]
+            ]
+            if missing_inputs:
+                logger.warning(
+                    "Skipping test case missing required DUT input(s): %s",
+                    missing_inputs,
+                )
+                continue
+
+            # Every actual input must be present. Adding random values here would
+            # change the generated test's intended stimulus and can create false
+            # mismatches or invalid result artifacts.
             for actual_input, width in actual_signals["inputs"].items():
                 if actual_input not in corrected_data["inputs"]:
-                    random_val = generate_random_value(width)
-                    corrected_data["inputs"][actual_input] = random_val
-                    logger.info(f"Added random value for unmatched input '{actual_input}': {random_val}")
+                    logger.error(f"Internal error: required input '{actual_input}' was not validated")
+                    sys.exit(1)
 
-            # Process output signals with fuzzy matching
+            # Expected outputs must match declared DUT outputs exactly. Fuzzy
+            # output remapping can silently compare a generated non-port name
+            # against the wrong real output (e.g. "one" -> "done").
             for test_signal, value in data.get("expected_outputs", {}).items():
                 if len(actual_signals["outputs"]) > 0:
-                    matched_signal = fuzzy_match_signal(test_signal, actual_signals["outputs"])
-                    if matched_signal:
-                        corrected_data["expected_outputs"][matched_signal] = value
+                    if test_signal in actual_signals["outputs"]:
+                        corrected_data["expected_outputs"][test_signal] = value
                     else:
                         logger.warning(f"Output signal '{test_signal}' not matched to any actual output, skipping")
                 else:
@@ -323,6 +378,13 @@ def main():
 
         datas = corrected_datas
         logger.info(f"Signal mapping complete: {len(datas)} test vectors after correction")
+        if not datas:
+            logger.error("No test vectors with matched expected outputs after signal mapping")
+            sys.exit(1)
+
+    if not datas:
+        logger.error("No test vectors with matched expected outputs")
+        sys.exit(1)
 
     ###############################################
     # Generate Harness with JSON testbench (Combinational Logic)
@@ -334,6 +396,9 @@ def main():
 #include <memory>
 #include <iostream>
 #include <verilated.h>
+#if VM_COVERAGE
+# include <verilated_cov.h>
+#endif
 #include "Vtop_module.h"
 
 int fuzz_poke() {
@@ -393,6 +458,11 @@ int fuzz_poke() {
         for name, value in inputs.items():
             temp = sanitize_value(value)
 
+            # Inputs must be concrete stimulus values.
+            if any(c not in '01' for c in temp.lower()):
+                cpp_code += f"""    printf("  Input {name} = 0b{temp} (skipped - contains x/z/unknown)\\n");\n"""
+                continue
+
             # Get actual width from Verilog definition
             actual_width = actual_signals["inputs"].get(name, len(temp))
 
@@ -440,6 +510,11 @@ int fuzz_poke() {
         cpp_code += f"""    // Check outputs\n"""
         for name, value in expected_outputs.items():
             temp = sanitize_value(value)
+
+            # Unknown expected outputs are explicit don't-cares.
+            if any(c not in '01' for c in temp.lower()):
+                cpp_code += f"""    printf("  Output {name}: expected=0b{temp} (skipped - contains x/z/unknown)\\n");\n"""
+                continue
 
             # Get actual width from Verilog definition
             actual_width = actual_signals["outputs"].get(name, len(temp))
@@ -508,7 +583,12 @@ int fuzz_poke() {
         std::cout << "✗ Total failures: " << unpass_total << std::endl;
         std::cout << "========================================" << std::endl;
     }
-    
+
+#if VM_COVERAGE
+    // Write line-coverage from the model's own context (functional coverage)
+    top->contextp()->coveragep()->write("coverage.dat");
+#endif
+
     return unpass_total;
 }
 """

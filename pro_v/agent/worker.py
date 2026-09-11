@@ -13,12 +13,17 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, Dict, List, Tuple
 from pro_v.agent.utils import check_compile_success, check_simulation_pass
 
 logger = logging.getLogger(__name__)
+
+
+def _python_executable() -> str:
+    return os.getenv("PRO_V_PYTHON") or sys.executable or "python3"
 logger.setLevel(logging.DEBUG)
 
 # Configure logging to console with basic configuration
@@ -261,7 +266,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
 
                 # Execute: cd to file directory, then run python filename
                 result = subprocess.run(
-                    ["python", file_name],
+                    [_python_executable(), file_name],
                     cwd=file_dir,
                     capture_output=True,
                     text=True,
@@ -309,6 +314,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                 logger.error(f"Test file does not exist: {test_path}")
                 return 1, "", f"Test file not found: {test_path}", 0.0
             
+            shutil.rmtree(work_dir, ignore_errors=True)
             os.makedirs(work_dir, exist_ok=True)
 
             # Copy simulation framework files
@@ -396,6 +402,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                 logger.error(f"Test file does not exist: {test_path}")
                 return 1, "", f"Test file not found: {test_path}", 0.0
             
+            shutil.rmtree(work_dir, ignore_errors=True)
             os.makedirs(work_dir, exist_ok=True)
             
             # Copy simulation framework files
@@ -561,7 +568,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                 
                 # Execute stimulus generation script
                 result = subprocess.run(
-                    ["python", script_path],
+                    [_python_executable(), script_path],
                     cwd=task_folder,
                     capture_output=True,
                     text=True,

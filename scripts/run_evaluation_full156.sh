@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+########################################
+# >>> Config (edit these) <<<
+########################################
+# Visible GPUs in the order you want to consume them (comma-separated, no spaces)
+# Example for 8 GPUs: "0,1,2,3,4,5,6,7"
+GPU_IDS="0,1"
+
+# Model weights path (local dir or HF repo ID)
+MODEL_PATH="/home/abhijna/Pro-V/models/PRO-V-R1-8B"
+
+# Runtime environment containing Python deps and Verilator.
+PRO_V_ENV_DIR="${PRO_V_ENV_DIR:-/home/abhijna/miniforge3/envs/pro-v}"
+export PRO_V_PYTHON="${PRO_V_PYTHON:-${PRO_V_ENV_DIR}/bin/python}"
+export PATH="${PRO_V_ENV_DIR}/bin:${PATH}"
+
+# Served model name for the OpenAI-compatible server (defaults to basename of MODEL_PATH if empty)
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-PRO-V-R1-8B}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-full156_clean}"
+LLM_PROVIDER="${LLM_PROVIDER:-vllm}"  # vllm or openai
+# vLLM max context length
+MAX_LEN=36000
+
+# Base server port (replicas use PORT+i)
+PORT=8321
+
+# Parallelism knobs
+TP_SIZE=1
+DP_SIZE=2          # number of replicas (data-parallel); total GPUs used = TP_SIZE * DP_SIZE
+
+# Optional: extra vLLM flags, e.g. '--gpu-memory-utilization 0.95 --dtype auto'
+VLLM_EXTRA=""
+
+# Optional: extra args passed to prompting_top_agent_ray.py
+# Use --max_concurrency to control concurrent tasks (default: 50 in ray script)
+# Use --num_cpus to set Ray CPU resources (default: system_cpus/100)
+EXTRA_ARGS="${EXTRA_ARGS:---max_concurrency 12 --sampling_size 5}"
+
+# Task numbers to process (comma-separated or range, e.g., '1,2,3' or '1-10' or '1,5-10,15')
+# Leave empty to process all tasks (1-156)
+TASK_NUMBERS="${TASK_NUMBERS:-}"
+
+# ---- Sampling/runtime knobs (exported) ----
+TEMPERATURE=0
+TOP_P=0.1
+TEMPERATURE_SAMPLE=0.6
+TOP_P_SAMPLE=0.95
+MAX_TOKEN=20000
+ENABLE_THINKING=true
+PRO_V_GENERATION_RTL_BLIND=1
+PRO_V_ORACLE_RTL_BLIND=1
+PRO_V_UNSAFE_ALLOW_GOLDEN_OUTPUTS=0
+PRO_V_ALLOW_RTL_GUIDED_REPAIR=0
+PRO_V_REFRESH_EXPECTED_FROM_RTL=0
+PRO_V_PRE_EVAL_GOLDEN_CHECK=0
+PRO_V_COVERAGE_CLOSURE="${PRO_V_COVERAGE_CLOSURE:-0}"
+PRO_V_COVERAGE_TARGET="${PRO_V_COVERAGE_TARGET:-0.95}"
+PRO_V_COVERAGE_MAX_ITERS="${PRO_V_COVERAGE_MAX_ITERS:-6}"
+
+# Optional filters (empty means no filter)
+FILTER_INSTANCE=""
+
+FOLDER_PATH="${FOLDER_PATH:-./verilog-eval/HDLBits/test_benchmark_new.json}"
+RUN_IDENTIFIER="gen_tb"
+KEY_CFG_PATH="../key.cfg"
+USE_GOLDEN_REF=true
+SAMPLING_SIZE=5
+STIMULI_SAMPLING_SIZE=3
+MAX_TRIALS=5
+STAGE=0
+DAY="20250408"
+DUT=false
+########################################
+
+# ------------------------------
+# Derived and exported settings
+# ------------------------------
+export TEMPERATURE TOP_P TEMPERATURE_SAMPLE TOP_P_SAMPLE MAX_TOKEN \
+       ENABLE_THINKING FOLDER_PATH RUN_IDENTIFIER KEY_CFG_PATH USE_GOLDEN_REF \
+       SAMPLING_SIZE STIMULI_SAMPLING_SIZE MAX_TRIALS STAGE DAY DUT \
+       FILTER_INSTANCE LLM_PROVIDER PRO_V_GENERATION_RTL_BLIND PRO_V_ORACLE_RTL_BLIND \
+       PRO_V_UNSAFE_ALLOW_GOLDEN_OUTPUTS PRO_V_ALLOW_RTL_GUIDED_REPAIR \
+       PRO_V_REFRESH_EXPECTED_FROM_RTL PRO_V_PRE_EVAL_GOLDEN_CHECK \
+       PRO_V_COVERAGE_CLOSURE PRO_V_COVERAGE_TARGET PRO_V_COVERAGE_MAX_ITERS
+
+if [[ "${LLM_PROVIDER}" == "openai" ]]; then
+  : "${OPENAI_API_KEY:?OPENAI_API_KEY must be set when LLM_PROVIDER=openai}"
+  OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+  OPENAI_MODEL="${OPENAI_MODEL:-${SERVED_MODEL_NAME}}"
+  SERVED_MODEL_NAME="${OPENAI_MODEL}"
+  export OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY
+fi
+
+# Resolve served model name if not explicitly set
+if [[ -z "${SERVED_MODEL_NAME}" ]]; then
+  SERVED_MODEL_NAME="$(basename "${MODEL_PATH}")"
+fi
+
+# Find Python
+if [[ -n "${PRO_V_PYTHON:-}" && -x "${PRO_V_PYTHON}" ]]; then
+  PY="${PRO_V_PYTHON}"
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "[ERROR] Python not found. Please install python3 or adjust PATH." >&2
+  exit 1
+fi
+export PRO_V_PYTHON="${PY}"
+echo "[INFO] Python: $(${PY} --version 2>&1)"
+echo "[INFO] Verilator: $(command -v verilator || true)"
+verilator --version || true
+
+# Tool checks
+if [[ "${LLM_PROVIDER}" != "openai" ]]; then
+  command -v curl >/dev/null 2>&1 || { echo "[ERROR] 'curl' is required." >&2; exit 1; }
+  command -v lsof >/dev/null 2>&1 || { echo "[ERROR] 'lsof' is required for port checks." >&2; exit 1; }
+  command -v nvidia-smi >/dev/null 2>&1 || { echo "[ERROR] 'nvidia-smi' is required for local vLLM runs." >&2; exit 1; }
+  if ! nvidia-smi >/dev/null 2>&1; then
+    echo "[ERROR] NVIDIA driver/GPU is not available; cannot launch local vLLM. Use LLM_PROVIDER=openai or fix the GPU driver." >&2
+    exit 1
+  fi
+fi
+
+# ------------------------------
+# GPU parsing and validation
+# ------------------------------
+TOTAL_GPUS_NEEDED=0
+replica_cuda_devices=()
+
+if [[ "${LLM_PROVIDER}" != "openai" ]]; then
+  IFS=',' read -r -a GPU_ARR <<< "${GPU_IDS}"
+  TOTAL_GPUS_AVAILABLE="${#GPU_ARR[@]}"
+  TOTAL_GPUS_NEEDED=$(( TP_SIZE * DP_SIZE ))
+
+  if (( TOTAL_GPUS_NEEDED < 1 )); then
+    echo "[ERROR] Invalid TOTAL_GPUS_NEEDED=${TOTAL_GPUS_NEEDED}. Check TP_SIZE and DP_SIZE." >&2
+    exit 1
+  fi
+
+  if (( TOTAL_GPUS_AVAILABLE < TOTAL_GPUS_NEEDED )); then
+    echo "[ERROR] Not enough GPUs. Available=${TOTAL_GPUS_AVAILABLE} from GPU_IDS='${GPU_IDS}', needed=${TOTAL_GPUS_NEEDED} (TP_SIZE*DP_SIZE)." >&2
+    exit 1
+  fi
+
+  # Slice GPUs for each replica
+  for (( i=0; i<DP_SIZE; i++ )); do
+    start=$(( i * TP_SIZE ))
+    end=$(( start + TP_SIZE - 1 ))
+    slice=""
+    for (( j=start; j<=end; j++ )); do
+      slice+="${GPU_ARR[j]},"
+    done
+    slice="${slice%,}"
+    replica_cuda_devices+=("${slice}")
+  done
+fi
+
+# ------------------------------
+# Helpers
+# ------------------------------
+wait_for_ready() {
+  # Poll an OpenAI-compatible /v1/models endpoint
+  local port="$1"
+  local seconds="${2:-600}"
+  for _ in $(seq 1 "${seconds}"); do
+    if curl -fsS "http://127.0.0.1:${port}/v1/models" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+get_remote_model_name() {
+  curl -fsS "http://127.0.0.1:${1}/v1/models" \
+    | ${PY} - <<'PY' || true
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    models = data.get("data", [])
+    if models:
+        print(models[0].get("id",""))
+except Exception:
+    pass
+PY
+}
+
+launch_replica() {
+  local idx="$1"
+  local port="$2"
+  local cuda="$3"
+  local log_file="vllm_${port}.log"
+
+  echo "[INFO] Launching vLLM replica #${idx}: CUDA=${cuda}, port=${port}, model='${MODEL_PATH}', served-name='${SERVED_MODEL_NAME}', TP=${TP_SIZE}, MAX_LEN=${MAX_LEN}"
+  (
+    set -x
+    CUDA_VISIBLE_DEVICES="${cuda}" \
+    ${PY} -m vllm.entrypoints.openai.api_server \
+      --model "${MODEL_PATH}" \
+      --served-model-name "${SERVED_MODEL_NAME}" \
+      --tensor-parallel-size "${TP_SIZE}" \
+      --max-model-len "${MAX_LEN}" \
+      --port "${port}" \
+      ${VLLM_EXTRA} \
+      >"${log_file}" 2>&1
+  ) &
+  local pid=$!
+  echo "[INFO] vLLM replica #${idx} started (PID=${pid}); logs: ${log_file}"
+  STARTED_PIDS+=("${pid}")
+  STARTED_LOGS+=("${log_file}")
+  STARTED_PORTS+=("${port}")
+  STARTED_FLAGS+=("launched")
+}
+
+try_link_or_launch() {
+  # Enforce: try to link within 3s; if not available and port free => launch and wait 120s
+  # If port occupied by non-vLLM, error and exit.
+  local idx="$1"
+  local port="$2"
+  local cuda="$3"
+
+  echo "[INFO] Probing port :${port} for an existing vLLM/OpenAI server (3s retry)..."
+  if wait_for_ready "${port}" 3; then
+    local name
+    name="$(get_remote_model_name "${port}" || true)"
+    if [[ -n "${name}" ]]; then
+      echo "[INFO] Reusing running server on :${port} serving '${name}'."
+      SERVED_MODEL_NAME="${name}"
+    else
+      echo "[WARN] Server on :${port} responded but model list was empty/unparseable; reusing anyway."
+    fi
+    STARTED_PIDS+=("")
+    STARTED_LOGS+=("<external>")
+    STARTED_PORTS+=("${port}")
+    STARTED_FLAGS+=("existing")
+    return 0
+  fi
+
+  # Not ready within 3s; check if port is free to launch our own
+  if lsof -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "[ERROR] Port ${port} is occupied by a non-responsive or non-vLLM service. Stop it or change PORT." >&2
+    exit 1
+  fi
+
+  echo "[INFO] No server detected on :${port} within 3s. Launching our vLLM and waiting up to 120s..."
+  launch_replica "${idx}" "${port}" "${cuda}"
+  if ! wait_for_ready "${port}" 600; then
+    echo "[ERROR] vLLM on port ${port} did not become ready in 120s. Check logs: ${STARTED_LOGS[-1]}." >&2
+    exit 1
+  fi
+  echo "[INFO] vLLM is ready on :${port}."
+}
+
+# ------------------------------
+# Launch orchestration
+# ------------------------------
+STARTED_PIDS=()
+STARTED_LOGS=()
+STARTED_PORTS=()
+STARTED_FLAGS=()  # "existing" or "launched"
+
+# Cleanup all launched replicas on exit
+cleanup() {
+  local code=$?
+  echo "[INFO] Cleaning up (exit code ${code})."
+  for i in "${!STARTED_PIDS[@]}"; do
+    local pid="${STARTED_PIDS[$i]}"
+    local flag="${STARTED_FLAGS[$i]}"
+    if [[ -n "${pid}" && "${flag}" == "launched" ]]; then
+      if ps -p "${pid}" >/dev/null 2>&1; then
+        echo "[INFO] Terminating vLLM process (PID=${pid})"
+        kill "${pid}" >/dev/null 2>&1 || true
+        sleep 1
+        pkill -P "${pid}" >/dev/null 2>&1 || true
+        if ps -p "${pid}" >/dev/null 2>&1; then
+          kill -9 "${pid}" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+  done
+}
+trap cleanup EXIT INT TERM ERR
+
+# DP orchestration: apply "link in 3s else launch & wait 120s" to each replica port
+if [[ "${LLM_PROVIDER}" == "openai" ]]; then
+  echo "[INFO] LLM_PROVIDER=openai; skipping local vLLM launch."
+  STARTED_PORTS=()
+elif (( DP_SIZE == 1 )); then
+  try_link_or_launch 0 "${PORT}" "${replica_cuda_devices[0]}"
+else
+  # First pass: probe existing servers or launch new ones (in parallel)
+  echo "[INFO] Launching ${DP_SIZE} vLLM replicas in parallel..."
+  for (( i=0; i<DP_SIZE; i++ )); do
+    rport=$(( PORT + i ))
+    cuda="${replica_cuda_devices[$i]}"
+
+    echo "[INFO] Probing port :${rport} for an existing vLLM/OpenAI server (3s retry)..."
+    if wait_for_ready "${rport}" 3; then
+      name="$(get_remote_model_name "${rport}" || true)"
+      if [[ -n "${name}" ]]; then
+        echo "[INFO] Reusing running server on :${rport} serving '${name}'."
+        SERVED_MODEL_NAME="${name}"
+      else
+        echo "[WARN] Server on :${rport} responded but model list was empty/unparseable; reusing anyway."
+      fi
+      STARTED_PIDS+=("")
+      STARTED_LOGS+=("<external>")
+      STARTED_PORTS+=("${rport}")
+      STARTED_FLAGS+=("existing")
+    else
+      # Not ready within 3s; check if port is free to launch our own
+      if lsof -iTCP:"${rport}" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[ERROR] Port ${rport} is occupied by a non-responsive or non-vLLM service. Stop it or change PORT." >&2
+        exit 1
+      fi
+
+      echo "[INFO] No server detected on :${rport}. Launching vLLM replica #${i} in background..."
+      launch_replica "${i}" "${rport}" "${cuda}"
+    fi
+  done
+  
+  # Second pass: wait for all newly launched servers to become ready
+  echo "[INFO] Waiting for all newly launched vLLM replicas to become ready (600s timeout each)..."
+  for i in "${!STARTED_PORTS[@]}"; do
+    prt="${STARTED_PORTS[$i]}"
+    flag="${STARTED_FLAGS[$i]}"
+    if [[ "${flag}" == "launched" ]]; then
+      if ! wait_for_ready "${prt}" 600; then
+        echo "[ERROR] vLLM on port ${prt} did not become ready in 120s. Check logs: ${STARTED_LOGS[$i]}." >&2
+        exit 1
+      fi
+      echo "[INFO] vLLM is ready on :${prt}."
+    fi
+  done
+fi
+
+# ---------------------------------
+# Build endpoint list and sharding
+# ---------------------------------
+ENDPOINTS=()
+if [[ "${LLM_PROVIDER}" == "openai" ]]; then
+  ENDPOINTS+=("${OPENAI_BASE_URL}")
+else
+  for prt in "${STARTED_PORTS[@]}"; do
+    ENDPOINTS+=("http://127.0.0.1:${prt}")
+  done
+fi
+
+# Export all endpoints for Ray script to handle load balancing
+export VLLM_ENDPOINTS_CSV
+VLLM_ENDPOINTS_CSV="$(IFS=','; echo "${ENDPOINTS[*]}")"
+
+echo "[INFO] LLM provider: ${LLM_PROVIDER}"
+echo "[INFO] Active endpoints: ${VLLM_ENDPOINTS_CSV}"
+echo "[INFO] Model served as: ${SERVED_MODEL_NAME}"
+echo "[INFO] TP_SIZE=${TP_SIZE}, DP_SIZE=${DP_SIZE}, Total GPUs used=${TOTAL_GPUS_NEEDED}"
+
+# ---------------------------------
+# Run prompting_top_agent_ray.py
+# ---------------------------------
+echo "[INFO] Running prompting_top_agent_ray.py (testing all tasks)..."
+echo "[INFO] Load balancing across ${DP_SIZE} vLLM replica(s) will be handled by Ray"
+
+# Build thinking mode flag
+THINKING_FLAG=""
+if [[ "${ENABLE_THINKING}" == "true" ]]; then
+  THINKING_FLAG="--enable_thinking"
+  echo "[INFO] Thinking mode is enabled"
+fi
+
+# Build task numbers flag
+TASK_NUMBERS_FLAG=""
+if [[ -n "${TASK_NUMBERS}" ]]; then
+  TASK_NUMBERS_FLAG="--task_numbers ${TASK_NUMBERS}"
+  echo "[INFO] Processing specified tasks: ${TASK_NUMBERS}"
+else
+  echo "[INFO] Processing all tasks (1-156)"
+fi
+
+set -x
+${PY} pro_v/prompting_top_agent_ray.py \
+  --model "${SERVED_MODEL_NAME}" \
+  --vllm_endpoints "${VLLM_ENDPOINTS_CSV}" \
+  --experiment_name "${EXPERIMENT_NAME}" \
+  --benchmark_path "${FOLDER_PATH}" \
+  --sampling_size "${SAMPLING_SIZE}" \
+  ${TASK_NUMBERS_FLAG} \
+  ${EXTRA_ARGS}
+set +x
+
+echo "[INFO] Main evaluation finished."
+
+if [[ "${PRO_V_SKIP_STANDALONE_EVAL2:-0}" == "1" ]]; then
+  echo "[INFO] Skipping standalone evaluate2 report (PRO_V_SKIP_STANDALONE_EVAL2=1)."
+else
+  # ---------------------------------
+  # Run evaluate2 - Mutant Detection Analysis
+  # ---------------------------------
+  echo "[INFO] Starting evaluate2 - Mutant detection analysis..."
+
+  # Determine output report filename based on experiment name
+  EVAL2_REPORT_FILE="evaluation_report_${EXPERIMENT_NAME}_${DAY}.json"
+
+  # Experiment outputs directory
+  EXPERIMENT_OUTPUT_DIR="outputs/${EXPERIMENT_NAME}"
+
+  echo "[INFO] Running mutant detection evaluation on generated testbenches..."
+  echo "[INFO] Using experiment outputs from: ${EXPERIMENT_OUTPUT_DIR}"
+  set -x
+  ${PY} pro_v/simulate_and_evaluate_mutants.py \
+    --output "${EVAL2_REPORT_FILE}" \
+    --experiment_dir "${EXPERIMENT_OUTPUT_DIR}" \
+    ${TASK_NUMBERS:+--task_numbers "${TASK_NUMBERS}"}
+  set +x
+
+  echo "[INFO] Mutant detection evaluation completed. Report saved to: ${EVAL2_REPORT_FILE}"
+fi
+echo "[INFO] All evaluations finished."

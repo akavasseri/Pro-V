@@ -7,6 +7,8 @@
 
 // For std::unique_ptr
 #include <memory>
+// For std::cout / std::endl (do not rely on transitive includes)
+#include <iostream>
 
 // Include common routines
 #include <verilated.h>
@@ -46,7 +48,8 @@ int main(int argc, char** argv) {
     int unpass = fuzz_poke();
     std::cout<<"sim finished"<<std::endl;
     std::cout << "Unpass: " << unpass << std::endl;
-    // contextp->coveragep()->write("logs/coverage.dat");
+    // Coverage (when PRO_V_VERILATOR_COVERAGE=1) is written inside fuzz_poke()
+    // from the shared coverage context, before its models are destroyed.
 
 
 

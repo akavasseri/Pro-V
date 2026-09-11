@@ -22,6 +22,11 @@ import re
 import random
 
 
+def is_clock_signal(name):
+    lower = (name or "").lower()
+    return lower in {"clk", "clock"} or lower.startswith("clk") or lower.endswith("_clk") or "clock" in lower
+
+
 def extract_module_signals(verilog_file):
     """
     Extract input and output signal names from Verilog module.
@@ -32,9 +37,33 @@ def extract_module_signals(verilog_file):
             content = f.read()
     except FileNotFoundError:
         logger.warning(f"Verilog file '{verilog_file}' not found, cannot extract signals")
-        return {"inputs": {}, "outputs": {}, "clock_name": "clk"}
+        return {"inputs": {}, "outputs": {}, "clock_name": None, "clock_names": []}
 
-    signals = {"inputs": {}, "outputs": {}, "clock_name": "clk"}  # default to 'clk'
+    signals = {"inputs": {}, "outputs": {}, "clock_name": None, "clock_names": []}
+
+    try:
+        from pro_v.mutation_strength import parse_ports
+        ports = parse_ports(content)
+        if ports.inputs or ports.outputs or ports.clk_name:
+            signals = {
+                "inputs": {name: width for name, width in ports.inputs},
+                "outputs": {name: width for name, width in ports.outputs},
+                "clock_name": ports.clk_name,
+                "clock_names": [name for name, _ in getattr(ports, "clock_inputs", [])],
+            }
+            if len(signals["clock_names"]) > 1:
+                logger.warning(
+                    "Detected multiple clock-like inputs %s; harness will tick primary clock '%s'. "
+                    "Use multi-clock mode for independent clock-domain verification.",
+                    signals["clock_names"], signals["clock_name"],
+                )
+            logger.info(
+                f"Extracted signals via shared parser - inputs: {signals['inputs']}, "
+                f"outputs: {signals['outputs']}, clocks: {signals['clock_names']}"
+            )
+            return signals
+    except Exception as e:
+        logger.warning(f"Shared port parser failed, falling back to local parser: {e}")
 
     # Extract module declaration
     module_match = re.search(r'module\s+\w+\s*\((.*?)\);', content, re.DOTALL)
@@ -54,11 +83,14 @@ def extract_module_signals(verilog_file):
     for match in input_matches:
         msb, lsb, name = match
 
-        # Detect and save clock signal name (but don't add to regular inputs)
-        if name.lower() in ['clk', 'clock', 'rst', 'reset', 'rstn', 'rst_n']:
-            if name.lower() in ['clk', 'clock']:
-                signals["clock_name"] = name  # Save actual clock signal name
-                logger.info(f"Detected clock signal name: '{name}'")
+        # Detect and save clock signal name (but don't add to regular inputs).
+        # Reset signals are real DUT inputs and must be driven by the testbench;
+        # filtering them causes resettable sequential RTL to start from an
+        # implementation-specific initial state.
+        if is_clock_signal(name):
+            signals["clock_name"] = name  # Save actual clock signal name
+            signals.setdefault("clock_names", []).append(name)
+            logger.info(f"Detected clock signal name: '{name}'")
             continue
         if msb and lsb:
             width = int(msb) - int(lsb) + 1
@@ -82,7 +114,7 @@ def extract_module_signals(verilog_file):
             width = 1
         signals["outputs"][name] = width
 
-    logger.info(f"Extracted signals - inputs: {signals['inputs']}, outputs: {signals['outputs']}, clock: {signals['clock_name']}")
+    logger.info(f"Extracted signals - inputs: {signals['inputs']}, outputs: {signals['outputs']}, clocks: {signals['clock_names']}")
     return signals
 
 
@@ -107,6 +139,10 @@ def fuzzy_match_signal(test_name, actual_signals):
         if test_name.lower() == actual.lower():
             logger.info(f"Case-insensitive match: '{test_name}' -> '{actual}'")
             return actual
+
+    # Result runs should not silently reinterpret invented signal names.
+    # GenTB/PyChecker are responsible for producing real port names.
+    return None
 
     # Priority 3: Common name transformations
     # Try with/without underscores, common suffixes
@@ -195,6 +231,13 @@ def sanitize_value(value):
     
     # Remove any whitespace
     temp = temp.replace(" ", "")
+    if not temp:
+        raise ValueError("empty binary value")
+
+    # Preserve explicit don't-care/unknown expected values. The generated C++
+    # skips comparisons containing these bits, so they are valid testbench data.
+    if temp and all(c in 'xXzZ?' for c in temp):
+        return temp.lower().replace('?', 'x')
     
     # Check if it looks like a hex value (starts with 0x or 0X)
     if temp.lower().startswith("0x"):
@@ -268,11 +311,17 @@ def main():
 
     # Extract actual signal names from Verilog module
     actual_signals = extract_module_signals("top_module.v")
-    clock_signal_name = actual_signals.get("clock_name") or "clk"
-    if clock_signal_name == "clk":
-        logger.info("Using default clock signal name 'clk' for harness generation")
-    else:
+    clock_signal_names = list(actual_signals.get("clock_names") or [])
+    clock_signal_name = actual_signals.get("clock_name") or (clock_signal_names[0] if clock_signal_names else None)
+    if clock_signal_name:
         logger.info(f"Using detected clock signal name '{clock_signal_name}' for harness generation")
+    else:
+        logger.info("No clock input detected; sequential harness will run no-clock eval steps")
+    if len(clock_signal_names) > 1:
+        logger.warning(
+            "Toggling multiple clock-like inputs together in compatibility mode: %s",
+            clock_signal_names,
+        )
 
     # Map testbench signals to actual signals and fix clock_cycles
     if len(datas) > 0 and len(actual_signals["inputs"]) > 0:
@@ -284,12 +333,14 @@ def main():
 
             original_clock_cycles = data["clock_cycles"]
             corrected_data = {"clock_cycles": original_clock_cycles, "expected_outputs": []}
+            if isinstance(data.get("clock_values"), list):
+                corrected_data["clock_values"] = data["clock_values"][:original_clock_cycles]
 
             # Get input signals (excluding clock_cycles and expected_outputs)
             # IMPORTANT FIX: Filter out signals that are actually outputs in Verilog
             input_signals = {}
             for k, v in data.items():
-                if k in ["clock_cycles", "expected_outputs"]:
+                if k in ["clock_cycles", "expected_outputs", "clock_values"]:
                     continue
                 # Check if this signal is actually an output in Verilog (common testbench bug)
                 if k in actual_signals["outputs"]:
@@ -310,6 +361,8 @@ def main():
                 logger.warning(f"Adjusting clock_cycles from {original_clock_cycles} to {min_signal_length}")
                 corrected_data["clock_cycles"] = min_signal_length
 
+            invalid_input_signals = []
+
             # Process input signals with fuzzy matching
             for test_signal, values in input_signals.items():
                 matched_signal = fuzzy_match_signal(test_signal, actual_signals["inputs"])
@@ -325,18 +378,40 @@ def main():
                     if matched_output:
                         logger.warning(f"Signal '{test_signal}' matched to output '{matched_output}', not using as input")
                     else:
-                        # Check if it's a clock/reset signal that was filtered out
-                        if test_signal.lower() in ['clk', 'clock', 'rst', 'reset', 'rstn', 'rst_n']:
-                            logger.info(f"Signal '{test_signal}' is a clock/reset signal (handled by simulation framework)")
+                        # Clocks are handled by the simulation framework. Reset
+                        # signals are ordinary inputs and should have been matched.
+                        if is_clock_signal(test_signal):
+                            logger.info(f"Signal '{test_signal}' is a clock signal (handled by simulation framework)")
                         else:
-                            logger.warning(f"Input signal '{test_signal}' not matched to any Verilog signal, will use random values")
+                            logger.warning(f"Input signal '{test_signal}' not matched to any Verilog signal")
+                            invalid_input_signals.append(test_signal)
 
-            # Add random values for unmatched actual input signals
+            if invalid_input_signals:
+                logger.warning(
+                    "Skipping scenario with invalid input signal(s): %s",
+                    sorted(set(invalid_input_signals)),
+                )
+                continue
+
+            missing_inputs = [
+                actual_input
+                for actual_input in actual_signals["inputs"]
+                if actual_input not in corrected_data
+            ]
+            if missing_inputs:
+                logger.warning(
+                    "Skipping scenario missing required DUT input(s): %s",
+                    missing_inputs,
+                )
+                continue
+
+            # Every real DUT input must be present in the generated scenario.
+            # Randomly filling absent inputs changes the intended sequence and can
+            # create false eval failures or hide bad agent output.
             for actual_input, width in actual_signals["inputs"].items():
                 if actual_input not in corrected_data:
-                    random_vals = [generate_random_value(width) for _ in range(corrected_data["clock_cycles"])]
-                    corrected_data[actual_input] = random_vals
-                    logger.info(f"Added random values for unmatched input '{actual_input}'")
+                    logger.error(f"Internal error: required input '{actual_input}' was not validated")
+                    sys.exit(1)
 
             # Process expected outputs with fuzzy matching
             if "expected_outputs" in data and isinstance(data["expected_outputs"], list):
@@ -347,33 +422,51 @@ def main():
 
                     corrected_cycle = {}
 
-                    # Handle rising_edge outputs
+                    # Handle pre_clock outputs for asynchronous controls. These
+                    # are checked after inputs are applied while clk is still low,
+                    # before the rising edge.
+                    pre_clock_outputs = cycle_outputs.get("pre_clock")
+                    if isinstance(pre_clock_outputs, dict):
+                        corrected_cycle["pre_clock"] = {}
+                        for test_signal, value in pre_clock_outputs.items():
+                            if test_signal in actual_signals["outputs"]:
+                                corrected_cycle["pre_clock"][test_signal] = value
+                            else:
+                                logger.warning(f"Output signal '{test_signal}' not matched at cycle {cycle_idx}, skipping")
+                    elif pre_clock_outputs not in (None, {}):
+                        logger.warning(f"Unexpected pre_clock format at cycle {cycle_idx}, skipping (type={type(pre_clock_outputs).__name__})")
+
+                    # Handle rising_edge outputs. Expected outputs must match
+                    # declared DUT outputs exactly; fuzzy output remapping can
+                    # silently compare a generated non-port name against the
+                    # wrong real signal.
                     rising_outputs = cycle_outputs.get("rising_edge")
                     if isinstance(rising_outputs, dict):
                         corrected_cycle["rising_edge"] = {}
                         for test_signal, value in rising_outputs.items():
-                            matched_signal = fuzzy_match_signal(test_signal, actual_signals["outputs"])
-                            if matched_signal:
-                                corrected_cycle["rising_edge"][matched_signal] = value
+                            if test_signal in actual_signals["outputs"]:
+                                corrected_cycle["rising_edge"][test_signal] = value
                             else:
                                 logger.warning(f"Output signal '{test_signal}' not matched at cycle {cycle_idx}, skipping")
                     elif rising_outputs not in (None, {}):
                         logger.warning(f"Unexpected rising_edge format at cycle {cycle_idx}, skipping (type={type(rising_outputs).__name__})")
 
-                    # Handle falling_edge outputs
+                    # Handle falling_edge outputs with the same exact-name rule.
                     falling_outputs = cycle_outputs.get("falling_edge")
                     if isinstance(falling_outputs, dict):
                         corrected_cycle["falling_edge"] = {}
                         for test_signal, value in falling_outputs.items():
-                            matched_signal = fuzzy_match_signal(test_signal, actual_signals["outputs"])
-                            if matched_signal:
-                                corrected_cycle["falling_edge"][matched_signal] = value
+                            if test_signal in actual_signals["outputs"]:
+                                corrected_cycle["falling_edge"][test_signal] = value
                             else:
                                 logger.warning(f"Output signal '{test_signal}' not matched at cycle {cycle_idx}, skipping")
                     elif falling_outputs not in (None, {}):
                         logger.warning(f"Unexpected falling_edge format at cycle {cycle_idx}, skipping (type={type(falling_outputs).__name__})")
 
-                    if corrected_cycle:
+                    if any(
+                        isinstance(outputs, dict) and outputs
+                        for outputs in corrected_cycle.values()
+                    ):
                         corrected_data["expected_outputs"].append(corrected_cycle)
 
             # Only add scenario if we have some expected outputs
@@ -382,7 +475,13 @@ def main():
 
         datas = corrected_datas
         logger.info(f"Signal mapping complete: {len(datas)} scenarios after correction")
+        if not datas:
+            logger.error("No scenarios with matched expected outputs after signal mapping")
+            sys.exit(1)
 
+    if not datas:
+        logger.error("No scenarios with matched expected outputs")
+        sys.exit(1)
 
     ###############################################
     # Generate Harness with JSON testbench (Sequential Logic)
@@ -394,12 +493,22 @@ def main():
 #include <memory>
 #include <iostream>
 #include <verilated.h>
+#if VM_COVERAGE
+# include <verilated_cov.h>
+#endif
 #include "Vtop_module.h"
 
 int fuzz_poke() {
     int unpass_total = 0;
     int unpass = 0;
-    
+#if VM_COVERAGE
+    // Coverage is opt-in (PRO_V_VERILATOR_COVERAGE=1). In coverage mode every
+    // scenario shares ONE context, so line+toggle coverage accumulates across
+    // all scenarios and is written once at the end. When coverage is OFF the
+    // generated code is byte-identical to original Pro-V.
+    const std::unique_ptr<VerilatedContext> prov_cov_ctx{new VerilatedContext};
+#endif
+
 """
 
     # Collect all wide signals (input and output) from first data
@@ -428,10 +537,11 @@ int fuzz_poke() {
     for data in datas:
         clock_cycles = data["clock_cycles"]
         expected_outputs = data["expected_outputs"]
+        clock_values = data.get("clock_values") if isinstance(data.get("clock_values"), list) else []
         scenario_name = f"scenario_{scenario_idx}"
         
         # Get input signals (excluding clock_cycles and expected_outputs)
-        input_signals = {k: v for k, v in data.items() if k not in ["clock_cycles", "expected_outputs"]}
+        input_signals = {k: v for k, v in data.items() if k not in ["clock_cycles", "expected_outputs", "clock_values"]}
         
         cpp_code += f"""    ///////////////////////////////////////////////////////////\n"""
         cpp_code += f"""    // Scenario: {scenario_name}\n"""
@@ -442,15 +552,22 @@ int fuzz_poke() {
         
         # Create new instance for this scenario (to reset state)
         cpp_code += f"""    // Create new instance for scenario {scenario_name}\n"""
+        # In coverage mode reuse the one shared context so coverage accumulates;
+        # otherwise keep the original per-scenario context (byte-identical).
+        cpp_code += f"""#if VM_COVERAGE\n"""
+        cpp_code += f"""    auto* contextp_{scenario_idx}_ptr = prov_cov_ctx.get();\n"""
+        cpp_code += f"""#else\n"""
         cpp_code += f"""    const std::unique_ptr<VerilatedContext> contextp_{scenario_idx}{{new VerilatedContext}};\n"""
-        cpp_code += f"""    const std::unique_ptr<Vtop_module> top_{scenario_idx}{{new Vtop_module}};\n"""
         cpp_code += f"""    auto* contextp_{scenario_idx}_ptr = contextp_{scenario_idx}.get();\n"""
+        cpp_code += f"""#endif\n"""
+        cpp_code += f"""    const std::unique_ptr<Vtop_module> top_{scenario_idx}{{new Vtop_module}};\n"""
         cpp_code += f"""    auto* top_{scenario_idx}_ptr = top_{scenario_idx}.get();\n"""
         cpp_code += f"""    \n"""
         
         # Initialize all signals to 0
         cpp_code += f"""    // Initialize clock to 0\n"""
-        cpp_code += f"""    top_{scenario_idx}_ptr->{clock_signal_name} = 0;\n"""
+        for clk_name in clock_signal_names:
+            cpp_code += f"""    top_{scenario_idx}_ptr->{clk_name} = 0;\n"""
         cpp_code += f"""    \n"""
         
         # Initialize all input signals to 0 (or first cycle values if available)
@@ -525,12 +642,80 @@ int fuzz_poke() {
             cpp_code += f"""    // Evaluate with inputs set (clock still low)\n"""
             cpp_code += f"""    top_{scenario_idx}_ptr->eval();\n"""
             cpp_code += f"""    \n"""
+
+            # Check outputs after input application, before the clock edge. This
+            # catches asynchronous reset/set behavior and differentiates it from
+            # synchronous-only mutants.
+            if "pre_clock" in expected_outputs[cycle]:
+                cpp_code += f"""    // Check outputs before rising edge (async/pre-clock)\n"""
+                for name, value in expected_outputs[cycle]["pre_clock"].items():
+                    temp = sanitize_value(value)
+
+                    # Skip outputs with 'x', 'z', or other non-binary values
+                    if any(c not in '01' for c in temp.lower()):
+                        cpp_code += f"""    printf("  Pre-clock output {name}: expected=0b{temp} (skipped - contains x/z/unknown)\\n");\n"""
+                        continue
+
+                    # Get actual width from Verilog definition
+                    actual_width = actual_signals["outputs"].get(name, len(temp))
+
+                    # Pad or truncate temp to match actual width
+                    if len(temp) < actual_width:
+                        temp = temp.zfill(actual_width)
+                    elif len(temp) > actual_width:
+                        temp = temp[-actual_width:]  # Take rightmost bits
+
+                    hex_len = (len(temp) + 3) // 4
+                    hex_value = hex(int(temp, 2))[2:].zfill(hex_len)
+
+                    # Decide based on ACTUAL VERILOG WIDTH, not testbench value length
+                    if actual_width <= 64:
+                        # Regular output signal
+                        # Expected: from JSON testbench data, Actual: from simulation
+                        cpp_code += f"""    printf("  Pre-clock output {name}: expected(from JSON)=0x{hex_value}, actual(from sim)=0x%llx\\n", (unsigned long long)top_{scenario_idx}_ptr->{name});\n"""
+                        cpp_code += f"""    if (top_{scenario_idx}_ptr->{name} != 0x{hex_value}) {{\n"""
+                        cpp_code += f"""        unpass++;\n"""
+                        cpp_code += f"""        printf("  [FAIL] Mismatch at {name} (pre-clock) in cycle {cycle}\\n");\n"""
+                        cpp_code += f"""    }} else {{\n"""
+                        cpp_code += f"""        printf("  [PASS] {name} matched (pre-clock)\\n");\n"""
+                        cpp_code += f"""    }}\n"""
+                    else:
+                        # > 64 bits: Must use VlWide
+                        n_words = wide_output_signals[name]  # Already computed based on actual width
+
+                        padded = temp.zfill(n_words * 32)
+                        chunks = [
+                            int(padded[-32 * (k + 1): -32 * k or None], 2)
+                            for k in range(n_words)
+                        ]
+
+                        # Set expected values from JSON testbench data
+                        for k, c in enumerate(chunks):
+                            cpp_code += f"""    {name}_wide[{k}] = 0x{c:08X}u;\n"""
+
+                        # Compare: expected (from JSON) vs actual (from simulation)
+                        cpp_code += f"""    printf("  Pre-clock output {name} (wide):\\n");\n"""
+                        cpp_code += f"""    bool {name}_pre_clock_match_s{scenario_idx}_c{cycle} = true;\n"""
+                        for k in range(n_words):
+                            cpp_code += f"""    printf("    [{k}] expected(from JSON)=0x%08X, actual(from sim)=0x%08X\\n", {name}_wide[{k}], top_{scenario_idx}_ptr->{name}[{k}]);\n"""
+                            cpp_code += f"""    if (top_{scenario_idx}_ptr->{name}[{k}] != {name}_wide[{k}]) {name}_pre_clock_match_s{scenario_idx}_c{cycle} = false;\n"""
+
+                        cpp_code += f"""    if (!{name}_pre_clock_match_s{scenario_idx}_c{cycle}) {{\n"""
+                        cpp_code += f"""        unpass++;\n"""
+                        cpp_code += f"""        printf("  [FAIL] Mismatch at {name} (pre-clock) in cycle {cycle}\\n");\n"""
+                        cpp_code += f"""    }} else {{\n"""
+                        cpp_code += f"""        printf("  [PASS] {name} matched (pre-clock)\\n");\n"""
+                        cpp_code += f"""    }}\n"""
             
             # Rising edge: clk 0->1
             cpp_code += f"""    // Rising edge: 0->1\n"""
-            cpp_code += f"""    top_{scenario_idx}_ptr->{clock_signal_name} = 1;\n"""
+            cycle_clock_values = clock_values[cycle] if cycle < len(clock_values) and isinstance(clock_values[cycle], dict) else {}
+            for clk_name in clock_signal_names:
+                clk_level = 1 if not cycle_clock_values else int(bool(cycle_clock_values.get(clk_name, 0)))
+                cpp_code += f"""    top_{scenario_idx}_ptr->{clk_name} = {clk_level};\n"""
             cpp_code += f"""    top_{scenario_idx}_ptr->eval();\n"""
             cpp_code += f"""    contextp_{scenario_idx}_ptr->timeInc(1);\n"""
+            cpp_code += f"""    top_{scenario_idx}_ptr->eval();\n"""
             cpp_code += f"""    \n"""
             
             # Check outputs after rising edge
@@ -598,7 +783,8 @@ int fuzz_poke() {
             # Falling edge: clk 1->0
             cpp_code += f"""    \n"""
             cpp_code += f"""    // Falling edge\n"""
-            cpp_code += f"""    top_{scenario_idx}_ptr->{clock_signal_name} = 0;\n"""
+            for clk_name in clock_signal_names:
+                cpp_code += f"""    top_{scenario_idx}_ptr->{clk_name} = 0;\n"""
             cpp_code += f"""    top_{scenario_idx}_ptr->eval();\n"""
             cpp_code += f"""    contextp_{scenario_idx}_ptr->timeInc(1);\n"""
             cpp_code += f"""    \n"""
@@ -691,7 +877,12 @@ int fuzz_poke() {
         std::cout << "✗ Total failures: " << unpass_total << std::endl;
         std::cout << "========================================" << std::endl;
     }
-    
+#if VM_COVERAGE
+    // Observational only: write accumulated line+toggle coverage. This does not
+    // affect unpass_total (the eval0/1/2 correctness signal).
+    prov_cov_ctx->coveragep()->write("coverage.dat");
+    std::cout << "coverage written: coverage.dat" << std::endl;
+#endif
     return unpass_total;
 }
 """

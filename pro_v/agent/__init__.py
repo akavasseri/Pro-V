@@ -7,12 +7,13 @@ Python code checking, and verification.
 
 from . import gen_tb
 from . import pychecker
+from . import judge
 from . import gen_rtl
 
 
 __all__ = [
     "gen_tb",
     "pychecker",
+    "judge",
     "gen_rtl",
-    "verifier"
 ]

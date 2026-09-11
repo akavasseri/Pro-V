@@ -383,7 +383,7 @@ def get_prompt_for_mode(circuit_type: str, mode: str = "test") -> tuple:
         # For testing - simpler prompts
         sys_prompt, gen_prompt = get_prompt_for_mode("SEQ", mode="test")
     """
-    if circuit_type == "CMB":
+    if str(circuit_type).lower() == "cmb":
         if mode in ["api", "generation"]:
             # Use detailed GENERATION_PROMPT with golden RTL for API calls
             return CMB_SYSTEM_PROMPT, CMB_GENERATION_PROMPT
@@ -430,4 +430,3 @@ def format_prompt(description: str, module_header: str, circuit_type: str = "CMB
         )
 
     return f"{system_prompt}\n\n{formatted_generation}"
-

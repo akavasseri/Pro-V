@@ -6,35 +6,41 @@ set -Eeuo pipefail
 ########################################
 # Visible GPUs in the order you want to consume them (comma-separated, no spaces)
 # Example for 8 GPUs: "0,1,2,3,4,5,6,7"
-GPU_IDS="0,1,2,3"
+GPU_IDS="${GPU_IDS:-0}"
 
 # Model weights path (local dir or HF repo ID)
-MODEL_PATH="Your local model path"
+MODEL_PATH="${MODEL_PATH:-/home/abhijna/Pro-V/models/PRO-V-R1-8B}"
+
+# Runtime environment containing Python deps and Verilator.
+PRO_V_ENV_DIR="${PRO_V_ENV_DIR:-/home/abhijna/miniforge3/envs/pro-v}"
+export PRO_V_PYTHON="${PRO_V_PYTHON:-${PRO_V_ENV_DIR}/bin/python}"
+export PATH="${PRO_V_ENV_DIR}/bin:${PATH}"
 
 # Served model name for the OpenAI-compatible server (defaults to basename of MODEL_PATH if empty)
-SERVED_MODEL_NAME="Your served model name"
-EXPERIMENT_NAME="Your experiment name"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-PRO-V-R1-8B}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-hdlbits_vlsi}"
+LLM_PROVIDER="${LLM_PROVIDER:-vllm}"  # vllm or openai
 # vLLM max context length
-MAX_LEN=36000
+MAX_LEN="${MAX_LEN:-36000}"
 
 # Base server port (replicas use PORT+i)
-PORT=8020
+PORT="${PORT:-8321}"
 
 # Parallelism knobs
-TP_SIZE=4          # tensor-parallel per replica
-DP_SIZE=1          # number of replicas (data-parallel); total GPUs used = TP_SIZE * DP_SIZE
+TP_SIZE="${TP_SIZE:-1}"
+DP_SIZE="${DP_SIZE:-1}"          # number of replicas (data-parallel); total GPUs used = TP_SIZE * DP_SIZE
 
 # Optional: extra vLLM flags, e.g. '--gpu-memory-utilization 0.95 --dtype auto'
-VLLM_EXTRA=""
+VLLM_EXTRA="${VLLM_EXTRA:-}"
 
 # Optional: extra args passed to prompting_top_agent_ray.py
 # Use --max_concurrency to control concurrent tasks (default: 50 in ray script)
 # Use --num_cpus to set Ray CPU resources (default: system_cpus/100)
-EXTRA_ARGS="--max_concurrency 50"
+EXTRA_ARGS="${EXTRA_ARGS:---max_concurrency 12}"
 
 # Task numbers to process (comma-separated or range, e.g., '1,2,3' or '1-10' or '1,5-10,15')
 # Leave empty to process all tasks (1-156)
-TASK_NUMBERS=""
+TASK_NUMBERS="${TASK_NUMBERS:-}"
 
 # ---- Sampling/runtime knobs (exported) ----
 TEMPERATURE=0
@@ -43,17 +49,28 @@ TEMPERATURE_SAMPLE=0.6
 TOP_P_SAMPLE=0.95
 MAX_TOKEN=20000
 ENABLE_THINKING=true
+PRO_V_GENERATION_RTL_BLIND=1
+PRO_V_ORACLE_RTL_BLIND=1
+PRO_V_UNSAFE_ALLOW_GOLDEN_OUTPUTS=0
+PRO_V_ALLOW_RTL_GUIDED_REPAIR=0
+PRO_V_REFRESH_EXPECTED_FROM_RTL=0
+PRO_V_PRE_EVAL_GOLDEN_CHECK=0
+PRO_V_COVERAGE_CLOSURE="${PRO_V_COVERAGE_CLOSURE:-1}"
+PRO_V_COVERAGE_TARGET="${PRO_V_COVERAGE_TARGET:-0.95}"
+PRO_V_COVERAGE_MAX_ITERS="${PRO_V_COVERAGE_MAX_ITERS:-6}"
+PRO_V_SKIP_STANDALONE_EVAL2="${PRO_V_SKIP_STANDALONE_EVAL2:-1}"
 
 # Optional filters (empty means no filter)
 FILTER_INSTANCE=""
 
-FOLDER_PATH="./verilog-eval/HDLBits/test_benchmark_new.json"
+FOLDER_PATH="${FOLDER_PATH:-./verilog-eval/HDLBits/test_benchmark_new.json}"
+BENCHMARK_FORMAT="${BENCHMARK_FORMAT:-auto}"
 RUN_IDENTIFIER="gen_tb"
 KEY_CFG_PATH="../key.cfg"
 USE_GOLDEN_REF=true
-SAMPLING_SIZE=5
-STIMULI_SAMPLING_SIZE=3
-MAX_TRIALS=5
+SAMPLING_SIZE="${SAMPLING_SIZE:-5}"
+STIMULI_SAMPLING_SIZE="${STIMULI_SAMPLING_SIZE:-3}"
+MAX_TRIALS="${MAX_TRIALS:-5}"
 STAGE=0
 DAY="20250408"
 DUT=false
@@ -65,7 +82,20 @@ DUT=false
 export TEMPERATURE TOP_P TEMPERATURE_SAMPLE TOP_P_SAMPLE MAX_TOKEN \
        ENABLE_THINKING FOLDER_PATH RUN_IDENTIFIER KEY_CFG_PATH USE_GOLDEN_REF \
        SAMPLING_SIZE STIMULI_SAMPLING_SIZE MAX_TRIALS STAGE DAY DUT \
-       FILTER_INSTANCE
+       BENCHMARK_FORMAT \
+       FILTER_INSTANCE LLM_PROVIDER PRO_V_GENERATION_RTL_BLIND PRO_V_ORACLE_RTL_BLIND \
+       PRO_V_UNSAFE_ALLOW_GOLDEN_OUTPUTS PRO_V_ALLOW_RTL_GUIDED_REPAIR \
+       PRO_V_REFRESH_EXPECTED_FROM_RTL PRO_V_PRE_EVAL_GOLDEN_CHECK \
+       PRO_V_COVERAGE_CLOSURE PRO_V_COVERAGE_TARGET PRO_V_COVERAGE_MAX_ITERS \
+       PRO_V_SKIP_STANDALONE_EVAL2
+
+if [[ "${LLM_PROVIDER}" == "openai" ]]; then
+  : "${OPENAI_API_KEY:?OPENAI_API_KEY must be set when LLM_PROVIDER=openai}"
+  OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+  OPENAI_MODEL="${OPENAI_MODEL:-${SERVED_MODEL_NAME}}"
+  SERVED_MODEL_NAME="${OPENAI_MODEL}"
+  export OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY
+fi
 
 # Resolve served model name if not explicitly set
 if [[ -z "${SERVED_MODEL_NAME}" ]]; then
@@ -73,7 +103,9 @@ if [[ -z "${SERVED_MODEL_NAME}" ]]; then
 fi
 
 # Find Python
-if command -v python3 >/dev/null 2>&1; then
+if [[ -n "${PRO_V_PYTHON:-}" && -x "${PRO_V_PYTHON}" ]]; then
+  PY="${PRO_V_PYTHON}"
+elif command -v python3 >/dev/null 2>&1; then
   PY=python3
 elif command -v python >/dev/null 2>&1; then
   PY=python
@@ -81,40 +113,55 @@ else
   echo "[ERROR] Python not found. Please install python3 or adjust PATH." >&2
   exit 1
 fi
+export PRO_V_PYTHON="${PY}"
+echo "[INFO] Python: $(${PY} --version 2>&1)"
+echo "[INFO] Verilator: $(command -v verilator || true)"
+verilator --version || true
 
 # Tool checks
-command -v curl >/dev/null 2>&1 || { echo "[ERROR] 'curl' is required." >&2; exit 1; }
-command -v lsof >/dev/null 2>&1 || { echo "[ERROR] 'lsof' is required for port checks." >&2; exit 1; }
+if [[ "${LLM_PROVIDER}" != "openai" ]]; then
+  command -v curl >/dev/null 2>&1 || { echo "[ERROR] 'curl' is required." >&2; exit 1; }
+  command -v lsof >/dev/null 2>&1 || { echo "[ERROR] 'lsof' is required for port checks." >&2; exit 1; }
+  command -v nvidia-smi >/dev/null 2>&1 || { echo "[ERROR] 'nvidia-smi' is required for local vLLM runs." >&2; exit 1; }
+  if ! nvidia-smi >/dev/null 2>&1; then
+    echo "[ERROR] NVIDIA driver/GPU is not available; cannot launch local vLLM. Use LLM_PROVIDER=openai or fix the GPU driver." >&2
+    exit 1
+  fi
+fi
 
 # ------------------------------
 # GPU parsing and validation
 # ------------------------------
-IFS=',' read -r -a GPU_ARR <<< "${GPU_IDS}"
-TOTAL_GPUS_AVAILABLE="${#GPU_ARR[@]}"
-TOTAL_GPUS_NEEDED=$(( TP_SIZE * DP_SIZE ))
-
-if (( TOTAL_GPUS_NEEDED < 1 )); then
-  echo "[ERROR] Invalid TOTAL_GPUS_NEEDED=${TOTAL_GPUS_NEEDED}. Check TP_SIZE and DP_SIZE." >&2
-  exit 1
-fi
-
-if (( TOTAL_GPUS_AVAILABLE < TOTAL_GPUS_NEEDED )); then
-  echo "[ERROR] Not enough GPUs. Available=${TOTAL_GPUS_AVAILABLE} from GPU_IDS='${GPU_IDS}', needed=${TOTAL_GPUS_NEEDED} (TP_SIZE*DP_SIZE)." >&2
-  exit 1
-fi
-
-# Slice GPUs for each replica
+TOTAL_GPUS_NEEDED=0
 replica_cuda_devices=()
-for (( i=0; i<DP_SIZE; i++ )); do
-  start=$(( i * TP_SIZE ))
-  end=$(( start + TP_SIZE - 1 ))
-  slice=""
-  for (( j=start; j<=end; j++ )); do
-    slice+="${GPU_ARR[j]},"
+
+if [[ "${LLM_PROVIDER}" != "openai" ]]; then
+  IFS=',' read -r -a GPU_ARR <<< "${GPU_IDS}"
+  TOTAL_GPUS_AVAILABLE="${#GPU_ARR[@]}"
+  TOTAL_GPUS_NEEDED=$(( TP_SIZE * DP_SIZE ))
+
+  if (( TOTAL_GPUS_NEEDED < 1 )); then
+    echo "[ERROR] Invalid TOTAL_GPUS_NEEDED=${TOTAL_GPUS_NEEDED}. Check TP_SIZE and DP_SIZE." >&2
+    exit 1
+  fi
+
+  if (( TOTAL_GPUS_AVAILABLE < TOTAL_GPUS_NEEDED )); then
+    echo "[ERROR] Not enough GPUs. Available=${TOTAL_GPUS_AVAILABLE} from GPU_IDS='${GPU_IDS}', needed=${TOTAL_GPUS_NEEDED} (TP_SIZE*DP_SIZE)." >&2
+    exit 1
+  fi
+
+  # Slice GPUs for each replica
+  for (( i=0; i<DP_SIZE; i++ )); do
+    start=$(( i * TP_SIZE ))
+    end=$(( start + TP_SIZE - 1 ))
+    slice=""
+    for (( j=start; j<=end; j++ )); do
+      slice+="${GPU_ARR[j]},"
+    done
+    slice="${slice%,}"
+    replica_cuda_devices+=("${slice}")
   done
-  slice="${slice%,}"
-  replica_cuda_devices+=("${slice}")
-done
+fi
 
 # ------------------------------
 # Helpers
@@ -243,7 +290,10 @@ cleanup() {
 trap cleanup EXIT INT TERM ERR
 
 # DP orchestration: apply "link in 3s else launch & wait 120s" to each replica port
-if (( DP_SIZE == 1 )); then
+if [[ "${LLM_PROVIDER}" == "openai" ]]; then
+  echo "[INFO] LLM_PROVIDER=openai; skipping local vLLM launch."
+  STARTED_PORTS=()
+elif (( DP_SIZE == 1 )); then
   try_link_or_launch 0 "${PORT}" "${replica_cuda_devices[0]}"
 else
   # First pass: probe existing servers or launch new ones (in parallel)
@@ -296,14 +346,19 @@ fi
 # Build endpoint list and sharding
 # ---------------------------------
 ENDPOINTS=()
-for prt in "${STARTED_PORTS[@]}"; do
-  ENDPOINTS+=("http://127.0.0.1:${prt}")
-done
+if [[ "${LLM_PROVIDER}" == "openai" ]]; then
+  ENDPOINTS+=("${OPENAI_BASE_URL}")
+else
+  for prt in "${STARTED_PORTS[@]}"; do
+    ENDPOINTS+=("http://127.0.0.1:${prt}")
+  done
+fi
 
 # Export all endpoints for Ray script to handle load balancing
 export VLLM_ENDPOINTS_CSV
 VLLM_ENDPOINTS_CSV="$(IFS=','; echo "${ENDPOINTS[*]}")"
 
+echo "[INFO] LLM provider: ${LLM_PROVIDER}"
 echo "[INFO] Active endpoints: ${VLLM_ENDPOINTS_CSV}"
 echo "[INFO] Model served as: ${SERVED_MODEL_NAME}"
 echo "[INFO] TP_SIZE=${TP_SIZE}, DP_SIZE=${DP_SIZE}, Total GPUs used=${TOTAL_GPUS_NEEDED}"
@@ -334,36 +389,39 @@ set -x
 ${PY} pro_v/prompting_top_agent_ray.py \
   --model "${SERVED_MODEL_NAME}" \
   --vllm_endpoints "${VLLM_ENDPOINTS_CSV}" \
-  --provider vllm \
   --experiment_name "${EXPERIMENT_NAME}" \
-  ${THINKING_FLAG} \
+  --benchmark_path "${FOLDER_PATH}" \
+  --benchmark_format "${BENCHMARK_FORMAT}" \
+  --sampling_size "${SAMPLING_SIZE}" \
   ${TASK_NUMBERS_FLAG} \
   ${EXTRA_ARGS}
 set +x
 
 echo "[INFO] Main evaluation finished."
 
-# ---------------------------------
-# Run evaluate2 - Mutant Detection Analysis
-# ---------------------------------
-echo "[INFO] Starting evaluate2 - Mutant detection analysis..."
+if [[ "${PRO_V_SKIP_STANDALONE_EVAL2:-0}" == "1" ]]; then
+  echo "[INFO] Skipping standalone evaluate2 report (PRO_V_SKIP_STANDALONE_EVAL2=1)."
+else
+  # ---------------------------------
+  # Run evaluate2 - Mutant Detection Analysis
+  # ---------------------------------
+  echo "[INFO] Starting evaluate2 - Mutant detection analysis..."
 
-# Determine output report filename based on experiment name
-EVAL2_REPORT_FILE="evaluation_report_${EXPERIMENT_NAME}_${DAY}.json"
+  # Determine output report filename based on experiment name
+  EVAL2_REPORT_FILE="evaluation_report_${EXPERIMENT_NAME}_${DAY}.json"
 
-# Experiment outputs directory
-EXPERIMENT_OUTPUT_DIR="outputs/${EXPERIMENT_NAME}"
+  # Experiment outputs directory
+  EXPERIMENT_OUTPUT_DIR="outputs/${EXPERIMENT_NAME}"
 
-echo "[INFO] Running mutant detection evaluation on generated testbenches..."
-echo "[INFO] Using experiment outputs from: ${EXPERIMENT_OUTPUT_DIR}"
-set -x
-${PY} pro_v/simulate_and_evaluate_mutants.py \
-  "${FOLDER_PATH}" \
-  --output "${EVAL2_REPORT_FILE}" \
-  --experiment_dir "${EXPERIMENT_OUTPUT_DIR}" \
-  ${TASK_NUMBERS:+--start 0} \
-  ${TASK_NUMBERS:+--limit $(echo "$TASK_NUMBERS" | tr ',' '\n' | wc -l)}
-set +x
+  echo "[INFO] Running mutant detection evaluation on generated testbenches..."
+  echo "[INFO] Using experiment outputs from: ${EXPERIMENT_OUTPUT_DIR}"
+  set -x
+  ${PY} pro_v/simulate_and_evaluate_mutants.py \
+    --output "${EVAL2_REPORT_FILE}" \
+    --experiment_dir "${EXPERIMENT_OUTPUT_DIR}" \
+    ${TASK_NUMBERS:+--task_numbers "${TASK_NUMBERS}"}
+  set +x
 
-echo "[INFO] Mutant detection evaluation completed. Report saved to: ${EVAL2_REPORT_FILE}"
+  echo "[INFO] Mutant detection evaluation completed. Report saved to: ${EVAL2_REPORT_FILE}"
+fi
 echo "[INFO] All evaluations finished."
